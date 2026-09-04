@@ -1,0 +1,30 @@
+.venv/
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Local runtime state, logs, and operator configuration.
+.local/
+*.log
+logs/
+config.json
+config.local.json
+*.local.json
+
+# Credentials and secret-bearing files. Keep example templates trackable.
+.env
+.env.*
+!.env.example
+*.secret
+*.secrets
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx

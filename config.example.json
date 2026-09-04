@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "roots": [
+    {
+      "id": "developer",
+      "path": "~/Developer",
+      "mode": "PROJECT_DISCOVERY"
+    }
+  ],
+  "workspaces": {
+    "example-repo": {
+      "path": "/absolute/path/to/repository",
+      "profile": "READ_ONLY",
+      "commands": {
+        "test": "pytest",
+        "lint": "ruff check .",
+        "build": "npm run build",
+        "dev": "npm run dev",
+        "format": "ruff format --check ."
+      }
+    },
+    "example-development": {
+      "path": "/absolute/path/to/development-repository",
+      "profile": "DEVELOPMENT",
+      "isolated_development": {
+        "auto_create_sessions": true,
+        "auto_resume_sessions": true,
+        "auto_resume_policy": "same_owner_same_task_safe_local",
+        "max_parallel_sessions": 6,
+        "allowed_base": "registered_project",
+        "allow_workspace_wide": false,
+        "integration_requires_approval": true,
+        "commit_requires_approval": true,
+        "push_requires_approval": true
+      },
+      "commands": {
+        "test": "python3 -m unittest discover",
+        "lint": "ruff check ."
+      },
+      "platform": {
+        "command_profiles": {
+          "python-version": {
+            "argv": ["python3", "--version"],
+            "allowed_args": {},
+            "network_class": "none"
+          }
+        },
+        "credential_slots": {
+          "github-api": {
+            "source_kind": "env",
+            "source_name": "GITHUB_TOKEN",
+            "allowed_profiles": ["github"]
+          }
+        },
+        "browser_profiles": {
+          "local-ui": {
+            "allowed_origins": ["http://127.0.0.1:3000", "http://localhost:3000"],
+            "viewport_width": 1280,
+            "viewport_height": 720
+          }
+        },
+        "github": {
+          "owner": "example-owner",
+          "repository": "example-repository",
+          "remote_name": "origin",
+          "remote_host": "github.com",
+          "api_origin": "https://api.github.com",
+          "credential_slot": "github-api",
+          "auth_required": true,
+          "allowed_base_branches": ["main"],
+          "required_checks": [],
+          "required_approvals": 1,
+          "merge_method": "squash",
+          "merge_queue_required": false,
+          "enforce_branch_protection": true
+        }
+      }
+    }
+  }
+}

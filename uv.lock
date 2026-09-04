@@ -1,0 +1,35 @@
+version = 1
+revision = 3
+requires-python = ">=3.11"
+
+[[package]]
+name = "chatgpt-dev-mcp"
+version = "0.41"
+source = { editable = "." }
+dependencies = [
+    { name = "coding-tools-mcp" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "coding-tools-mcp", specifier = "==0.2.3" }]
+
+[[package]]
+name = "coding-tools-mcp"
+version = "0.2.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyjwt" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f5/45/a0ee9065995bccaafe86ea777688de85fedc6c9930b5d71acd6fa8f8237c/coding_tools_mcp-0.2.3.tar.gz", hash = "sha256:600efc91de46771df7ab0f44858cfdc02d1d74d1af1a301b43e6fd1858a6ae0f", size = 129299, upload-time = "2026-08-13T03:39:17.066Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e4/37/e05e4c62bd32dccbc8097658d56d1593e193c14696682cf55837af8c6646/coding_tools_mcp-0.2.3-py3-none-any.whl", hash = "sha256:d8b40ea807417a45d66203dfdf259523327e2f86db5ce310e389208de4363749", size = 127322, upload-time = "2026-08-13T03:39:15.6Z" },
+]
+
+[[package]]
+name = "pyjwt"
+version = "2.13.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/3b/81/58d0ac84e1ef3a3843791d6954d94c0b33d526c75eeb1efbce9d0a4c4077/pyjwt-2.13.0.tar.gz", hash = "sha256:41571c89ca91598c79e8ef18a2d07367d4810fbbd6f637794879baf1b7703423", size = 107515, upload-time = "2026-05-21T19:54:36.618Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a3/5e/ecf12fdb62546d64385c158514e9b2b671f7832108ef2ecd2020ce0af2d1/pyjwt-2.13.0-py3-none-any.whl", hash = "sha256:66adcc2aff09b3f1bbd95fc1e1577df8ac8723c978552fd43304c8a290ac5728", size = 31274, upload-time = "2026-05-21T19:54:35.362Z" },
+]

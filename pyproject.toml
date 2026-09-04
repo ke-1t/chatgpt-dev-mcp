@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68,<77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chatgpt-dev-mcp"
+version = "0.41"
+description = "A registry and policy wrapper around coding-tools-mcp for local development workspaces."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "coding-tools-mcp==0.2.3",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Version Control :: Git",
+  "Topic :: Security",
+]
+
+[project.scripts]
+chatgpt-dev-mcp = "chatgpt_dev_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/ke-1t/chatgpt-dev-mcp"
+Issues = "https://github.com/ke-1t/chatgpt-dev-mcp/issues"
+Upstream = "https://github.com/xyTom/coding-tools-mcp"
+
+[tool.setuptools.packages.find]
+where = ["src"]
