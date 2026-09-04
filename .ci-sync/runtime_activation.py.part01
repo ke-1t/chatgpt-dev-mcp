@@ -1,0 +1,149 @@
+"""Fail-closed activation of an approved v26 runtime candidate.
+
+The controller deliberately contains no process or launchd policy.  A caller
+provides the official activation/rollback functions, while this module owns
+the immutable candidate pin and all pre/post safety checks.  This keeps the
+same contract usable by a canary harness and by the production maintenance
+capability without allowing caller-selected shell commands.
+"""
+
+from __future__ import annotations
+
+import ast
+import base64
+from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import subprocess
+from typing import Any, Callable, Mapping
+from urllib.parse import quote
+
+from .connector_resilience import persistence_db_identity
+from .persistence import PersistenceError, inspect_readonly_roots_schema
+
+
+V26_SCHEMA_VERSION = 14
+EXPECTED_V26_TOOL_COUNT = 76
+V26_BOOTSTRAP_CONTRACT_VERSION = "v26-bootstrap-v1"
+V26_PYTHON_LOCATOR = "workspace://chatgpt-dev-mcp/.venv/bin/python"
+ACTIVATION_DATABASE_SEMANTIC_DIGEST_VERSION = "activation-db-semantic-v1"
+ACTIVATION_DATABASE_EXCLUDED_TABLES = ("request_lifecycle_events",)
+ACTIVATION_MAX_PIN_DIAGNOSTIC_COMPONENTS = 64
+
+
+class RuntimeActivationError(RuntimeError):
+    """A candidate cannot be safely activated or read back."""
+
+    def __init__(self, code: str, message: str, *, details: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = dict(details or {})
+
+
+@dataclass(frozen=True)
+class CandidateRuntime:
+    source_root: Path
+    expected_head: str
+    expected_schema_version: int
+    entrypoint: Path
+    python_executable: Path
+    state_dir: Path
+    database_path: Path
+    expected_base_revision: str | None = None
+    expected_patch_hash: str = ""
+    expected_tool_count: int = EXPECTED_V26_TOOL_COUNT
+    expected_tool_schema_hash: str = ""
+
+
+@dataclass(frozen=True)
+class RuntimeReadback:
+    source_root: Path
+    head: str
+    schema_version: int
+    doctor_status: str
+    tool_count: int
+    tool_schema_hash: str = ""
+    pid: int | None = None
+    persistence_status: str = ""
+    cross_call_receipt_continuity: str = ""
+    readonly_root_continuity: str = ""
+    tunnel_status: str = ""
+    state_isolation: str = ""
+    port_isolation: str = ""
+    # Deployment identity is optional for embedders that only need the core
+    # controller contract.  The production host fills these fields from the
+    # live wrapper/manifest so activation can pin the actual state boundary.
+    state_database_identity: str = ""
+    database_path: Path | None = None
+    port: int | None = None
+    tunnel_identity: str = ""
+    runtime_path: Path | None = None
+    manifest_path: Path | None = None
+    python_executable: Path | None = None
+    base_revision: str = ""
+    patch_hash: str = ""
+    # ``None`` is deliberately treated as unknown.  A schema-compatible
+    # rollback source must also be a known clean checkout; a dirty/unknown
+    # source is not a last-known-good rollback authority.
+    source_clean: bool | None = None
+
+
+@dataclass(frozen=True)
+class _ActivationDatabaseFingerprint:
+    semantic_digest: str
+    database_identity: str
+    semantic_component_digests: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class ActivationPlan:
+    candidate: CandidateRuntime
+    current: RuntimeReadback
+    canary_receipt: Mapping[str, Any]
+    candidate_fingerprint: str
+    activation_database_semantic_digest: str = ""
+    database_identity: str = ""
+    semantic_component_digests: tuple[tuple[str, str], ...] = ()
+    semantic_digest_version: str = ACTIVATION_DATABASE_SEMANTIC_DIGEST_VERSION
+    excluded_audit_tables: tuple[str, ...] = ACTIVATION_DATABASE_EXCLUDED_TABLES
+    status: str = "READY"
+
+
+def _validate_database_assets(path: Path) -> None:
+    """Validate SQLite sidecars without using their bytes as activation state."""
+
+    for suffix in ("", "-wal", "-shm"):
+        asset = Path(f"{path}{suffix}")
+        try:
+            if asset.is_symlink():
+                raise RuntimeActivationError(
+                    "CANDIDATE_DATABASE_UNSAFE",
+                    "candidate database asset is not a regular file",
+                )
+            if not asset.exists():
+                if suffix == "":
+                    raise RuntimeActivationError(
+                        "CANDIDATE_DATABASE_UNAVAILABLE",
+                        "candidate database is unavailable",
+                    )
+                continue
+            if not asset.is_file():
+                raise RuntimeActivationError(
+                    "CANDIDATE_DATABASE_UNSAFE",
+                    "candidate database asset is not a regular file",
+                )
+        except RuntimeActivationError:
+            raise
+        except OSError as exc:
+            raise RuntimeActivationError(
+                "CANDIDATE_DATABASE_UNREADABLE",
+                "candidate database asset cannot be inspected",
+            ) from exc
+
+
+def _quote_sqlite_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
