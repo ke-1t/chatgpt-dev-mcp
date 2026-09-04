@@ -29,9 +29,13 @@ jobs:
             parts=(.ci-sync/${name}.py.part*)
             test -e "${parts[0]}"
             : > "src/chatgpt_dev_mcp/${name}.py"
-            for part in "${parts[@]}"; do
+            last=$((${#parts[@]} - 1))
+            for i in "${!parts[@]}"; do
+              part="${parts[$i]}"
               cat "$part" >> "src/chatgpt_dev_mcp/${name}.py"
-              printf '\n' >> "src/chatgpt_dev_mcp/${name}.py"
+              if [ "$i" -lt "$last" ] && [ -n "$(tail -c 1 "$part")" ]; then
+                printf '\n' >> "src/chatgpt_dev_mcp/${name}.py"
+              fi
             done
           done
 
