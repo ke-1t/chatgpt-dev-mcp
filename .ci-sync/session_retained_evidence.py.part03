@@ -1,0 +1,44 @@
+            reason = "WORKTREE_TO_CANONICAL_HISTORY_NOT_ANCESTOR" if observation.worktree_head_ancestor_of_canonical is False else "WORKTREE_TO_CANONICAL_HISTORY_UNKNOWN"
+            return _plan(observation, UNKNOWN, reason)
+    if not observation.index_clean:
+        return _plan(observation, BLOCKED, "WORKTREE_INDEX_DIRTY")
+    if not observation.untracked_manifest_valid:
+        return _plan(observation, UNKNOWN, "UNTRACKED_MANIFEST_UNKNOWN")
+
+    identity_changed = (
+        stored.get("device") != current.get("device")
+        or stored.get("inode") != current.get("inode")
+    )
+    identity_reason = (
+        "UNBORN_RETAINED_EVIDENCE"
+        if unborn_evidence
+        else "SOURCE_IDENTITY_CHANGED_UNVERIFIED"
+        if identity_changed
+        else "SOURCE_IDENTITY_MATCHED"
+    )
+    return _plan(
+        observation,
+        RETAINED_EVIDENCE_ELIGIBLE,
+        "WORKTREE_RETAINED",
+        identity_reason,
+        transition="cleanup_candidate",
+        actions=(
+            "preserve_worktree",
+            "archive_worktree",
+            "preserve_sidecar_evidence",
+            "transition_cleanup_candidate",
+        ),
+    )
+
+
+__all__ = [
+    "BLOCKED",
+    "RETAINED_EVIDENCE_ELIGIBLE",
+    "RETAINED_EVIDENCE_TERMINAL",
+    "RetainedEvidencePlan",
+    "UNKNOWN",
+    "classify_retained_evidence",
+    "is_accepted_semantic_disposition",
+    "is_active_retained_state",
+    "is_blocked_semantic_disposition",
+]
