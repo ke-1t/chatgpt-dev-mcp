@@ -1,0 +1,83 @@
+    if not observation.untracked_manifest_valid:
+        return _plan(observation, ADOPTION_UNKNOWN, "UNTRACKED_MANIFEST_UNKNOWN")
+
+    # Active authority signals: any of these means the bytes are owned by a live
+    # session/process/task and must not be silently accounted.
+    process_status = _to_text(observation.process_state.get("state") or "")
+    if process_status in _ACTIVE_STATES:
+        return _plan(observation, ADOPTION_BLOCKED, "BOUND_PROCESS")
+    if process_status not in {"", "absent", "stale", "exited"}:
+        return _plan(observation, ADOPTION_UNKNOWN, "PROCESS_STATE_INDETERMINATE")
+
+    lease_status = _to_text(observation.lease_state.get("state") or "")
+    if lease_status == "active":
+        return _plan(observation, ADOPTION_BLOCKED, "ACTIVE_WRITER_LEASE")
+    if lease_status not in {"", "released", "expired", "stale", "absent"}:
+        return _plan(observation, ADOPTION_UNKNOWN, "LEASE_STATE_INDETERMINATE")
+
+    session_status = _to_text(observation.session_state.get("status") or observation.session_state.get("state") or "")
+    if session_status in _AUTHORITY_STATES:
+        return _plan(observation, ADOPTION_BLOCKED, "ACTIVE_SESSION")
+    if session_status not in {"", "absent", "stale", "cleanup_candidate", "abandoned", "closed"}:
+        return _plan(observation, ADOPTION_UNKNOWN, "SESSION_STATE_INDETERMINATE")
+
+    if observation.collision_session_id is not None:
+        return _plan(observation, ADOPTION_BLOCKED, "EXISTING_IDENTITY_COLLISION")
+
+    # Owner remains UNKNOWN when it cannot be proven: we never fabricate it.
+    if observation.owner_known:
+        reasons.append("OWNER_KNOWN")
+    else:
+        reasons.append("OWNER_UNKNOWN_PRESERVED")
+
+    return _plan(
+        observation,
+        FORMALLY_ACCOUNTED_RETAINED_EVIDENCE,
+        *reasons,
+        actions=(
+            "preserve_worktree",
+            "preserve_sidecar_evidence",
+            "record_adoption_receipt",
+            "no_integration",
+            "no_delete",
+            "no_gc",
+        ),
+    )
+
+
+def _plan(
+    observation: LegacyWorktreeAdoptionObservation,
+    classification: str,
+    *reasons: str,
+    actions: tuple[str, ...] = (),
+) -> LegacyWorktreeAdoptionPlan:
+    return LegacyWorktreeAdoptionPlan(
+        observation=observation,
+        classification=classification,
+        reason_codes=tuple(dict.fromkeys(reasons)),
+        preservation_actions=actions,
+        state_digest=observation.state_digest,
+    )
+
+
+def adoption_receipt_id(worktree_path: str, state_digest: str) -> str:
+    if len(state_digest) != 64:
+        raise ValueError("adoption state digest is invalid")
+    from .session_state_reconciliation import ReconciliationError
+
+    if not re.fullmatch(r"^[A-Za-z0-9._:/\\-]{1,4096}$", worktree_path):
+        raise ReconciliationError("adoption worktree path identity is invalid")
+    return f"legacy-adoption:{worktree_path}:{state_digest}"
+
+
+__all__ = [
+    "ADOPTION_BLOCKED",
+    "ADOPTION_UNKNOWN",
+    "FORMALLY_ACCOUNTED_RETAINED_EVIDENCE",
+    "LEGACY_WORKTREE_ADOPTION_CAPABILITY_ID",
+    "LegacyWorktreeAdoptionObservation",
+    "LegacyWorktreeAdoptionPlan",
+    "UNMANAGED_EVIDENCE",
+    "adoption_receipt_id",
+    "classify_legacy_worktree_adoption",
+]
