@@ -12,6 +12,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
+RUN_LIVE_TESTS = os.environ.get("DEVMCP_RUN_LIVE_TESTS") == "1"
+
+
 def _request(
     port: int,
     payload: dict[str, object] | None = None,
@@ -335,6 +338,10 @@ class HttpTransportTests(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertIsNone(lookalike)
 
+    @unittest.skipUnless(
+        RUN_LIVE_TESTS,
+        "set DEVMCP_RUN_LIVE_TESTS=1 to exercise the host-managed v26 canary",
+    )
     def test_v26_canary_endpoint_advertises_distinct_narrow_surface(self) -> None:
         v26_session, _v26_init = _initialize(self.port, "v26-init", path="/mcp/v26-canary")
         self.assertIn("v26c_", v26_session)

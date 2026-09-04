@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 LIVE_EXECUTABLE = REPOSITORY_ROOT / ".venv" / "bin" / "chatgpt-dev-mcp"
+RUN_LIVE_TESTS = os.environ.get("DEVMCP_RUN_LIVE_TESTS") == "1"
 ROUTING_FIELDS = {"workspace_id", "working_tree_id", "session_id", "workspace_ref"}
 GLOBAL_TOOLS = {
     "check_exec_environment",
@@ -24,7 +25,10 @@ GLOBAL_TOOLS = {
 }
 
 
-@unittest.skipUnless(LIVE_EXECUTABLE.is_file(), "the repository live MCP executable is not installed")
+@unittest.skipUnless(
+    RUN_LIVE_TESTS and LIVE_EXECUTABLE.is_file(),
+    "set DEVMCP_RUN_LIVE_TESTS=1 and install the live MCP executable",
+)
 class LiveSchemaTests(unittest.TestCase):
     """Exercise the installed entry point, rather than only WrapperRuntime."""
 

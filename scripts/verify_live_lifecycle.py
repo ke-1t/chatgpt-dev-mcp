@@ -29,6 +29,7 @@ def main() -> int:
     executable = REPOSITORY_ROOT / ".venv" / "bin" / "chatgpt-dev-mcp"
     if not executable.is_file():
         raise SystemExit(f"[verify] FAIL: live executable is missing: {executable}")
+    os.environ["DEVMCP_RUN_LIVE_TESTS"] = "1"
     run_step("raw executable lifecycle and multi-client E2E", ["-m", "unittest", "tests.test_live_schema"])
     check_managed_tunnel()
     print("\nverify_live_lifecycle: PASS", flush=True)

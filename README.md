@@ -547,7 +547,7 @@ long-tail capabilities, schema/health metadata, dangerous-tool absence,
 Run the installed executable's live MCP schema regression test:
 
 ```sh
-.venv/bin/python -m unittest -v tests.test_live_schema
+DEVMCP_RUN_LIVE_TESTS=1 .venv/bin/python -m unittest -v tests.test_live_schema
 ```
 
 It starts `.venv/bin/chatgpt-dev-mcp` as a real STDIO child, compares its

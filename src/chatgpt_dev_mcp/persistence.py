@@ -50,6 +50,7 @@ _STATES = frozenset(
     }
 )
 _LEASE_STATES = frozenset({"active", "released", "expired", "stale"})
+_TERMINAL_LEASE_STATES = frozenset({"released", "expired", "stale"})
 _TASK_PROCESS_BINDING_STATES = frozenset({"active", "terminal", "stale"})
 _TASK_PROCESS_BINDING_FIELDS = frozenset(
     {
@@ -87,6 +88,49 @@ _READONLY_ROOT_SCHEMA_MISSING = "missing"
 _READONLY_ROOT_SCHEMA_NATIVE = "native"
 _READONLY_ROOT_SCHEMA_LEGACY_SCOPED_SUPERSET = "legacy_scoped_superset"
 _READONLY_ROOT_SCOPE_NAMESPACE = "chatgpt-dev-mcp:v26-readonly-root:v1"
+_OPERATOR_RECEIPT_METADATA_FIELDS = frozenset(
+    {
+        "record_type",
+        "operator_contract",
+        "action",
+        "actor",
+        "workspace_id",
+        "target_id",
+        "canonical_path",
+        "canonical_revision",
+        "director_generation",
+        "director_database_identity",
+        "schema_version",
+        "expected_state_hash",
+        "request_hash",
+        "request_id",
+        "preflight_allowed",
+        "eligibility",
+        "created_at",
+        "source_revision",
+        "candidate_id",
+        "artifact_role",
+        "database_identity",
+        "tool_schema_hash",
+        "candidate_head",
+        "content_digest",
+        "artifact_tree_digest",
+        "artifact_patch_hash",
+        "manifest_digest",
+        "python_digest",
+        "verification_receipt_id",
+        "verification_mode",
+        "verification_status",
+        "verification_result_digest",
+        "verification_test_count",
+        "preflight_id",
+        "status",
+        "reason",
+        "result_digest",
+        "readback_digest",
+        "resulting_state_hash",
+    }
+)
 _READONLY_ROOT_BASE_COLUMNS = (
     ("root_id", "TEXT", 0, None, 1),
     ("requested_path", "TEXT", 1, None, 0),
@@ -652,17 +696,22 @@ def _import_rows_hash(rows: object) -> str:
 class SqliteDirectorStore:
     """Bounded SQLite store with explicit migrations and fail-closed reads."""
 
-    def __init__(self, path: Path | str | None = None) -> None:
+    def __init__(self, path: Path | str | None = None, *, read_only: bool = False) -> None:
         selected_path = Path(path).expanduser() if path is not None else director_db_path()
-        self.path = self._secure_path(selected_path)
+        self._read_only = bool(read_only)
+        self.path = self._secure_path_read_only(selected_path) if self._read_only else self._secure_path(selected_path)
         self._lock = threading.RLock()
         self._writes_since_maintenance = 0
         self._readonly_roots_schema = _READONLY_ROOT_SCHEMA_MISSING
-        self._schema_version = self._bootstrap()
+        self._schema_version = self._bootstrap_read_only() if self._read_only else self._bootstrap()
 
     @property
     def schema_version(self) -> int:
         return self._schema_version
+
+    @property
+    def read_only(self) -> bool:
+        return self._read_only
 
     @property
     def readonly_roots_schema(self) -> str:
@@ -703,19 +752,54 @@ class SqliteDirectorStore:
         return path
 
     @staticmethod
-    def _connect_raw(path: Path) -> sqlite3.Connection:
+    def _secure_path_read_only(path: Path) -> Path:
+        """Validate an existing database without creating or chmod'ing it."""
+
+        if not path.is_absolute():
+            raise PersistenceError("database path must be absolute")
+        parent = path.parent
+        try:
+            if parent.is_symlink() or not parent.is_dir():
+                raise PersistenceError("database directory is not a private directory")
+            probe = Path(parent.anchor)
+            for component in parent.parts[1:]:
+                probe = probe / component
+                if probe.is_symlink() and probe not in {Path("/var"), Path("/tmp")}:
+                    raise PersistenceError("database directory contains a symlink")
+            if parent.stat().st_mode & 0o077:
+                raise PersistenceError("database directory is not private")
+            if path.is_symlink() or not path.is_file():
+                raise PersistenceError("database path is not a regular file")
+            if path.stat().st_mode & 0o077:
+                raise PersistenceError("database file is not private")
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(f"{path}{suffix}")
+                if not sidecar.exists():
+                    continue
+                if sidecar.is_symlink() or not sidecar.is_file() or sidecar.stat().st_mode & 0o077:
+                    raise PersistenceError("SQLite sidecar is not a regular private file")
+        except OSError as exc:
+            raise PersistenceError("database path cannot be inspected safely") from exc
+        return path
+
+    @staticmethod
+    def _connect_raw(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
         connection: sqlite3.Connection | None = None
         try:
             connection = sqlite3.connect(
-                str(path),
+                f"file:{path}?mode=ro" if read_only else str(path),
                 timeout=5.0,
                 isolation_level=None,
                 check_same_thread=False,
+                uri=read_only,
             )
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA busy_timeout=5000")
-            connection.execute("PRAGMA synchronous=FULL")
+            if read_only:
+                connection.execute("PRAGMA query_only=ON")
+            else:
+                connection.execute("PRAGMA synchronous=FULL")
             return connection
         except sqlite3.OperationalError as exc:
             if connection is not None:
@@ -731,13 +815,47 @@ class SqliteDirectorStore:
             sidecar = Path(f"{self.path}{suffix}")
             if sidecar.exists() and sidecar.is_symlink():
                 raise PersistenceError("SQLite sidecar is a symlink")
-        connection = self._connect_raw(self.path)
-        try:
-            self._restrict_database_assets()
-        except PersistenceError:
-            connection.close()
-            raise
+        connection = self._connect_raw(self.path, read_only=self._read_only)
+        if not self._read_only:
+            try:
+                self._restrict_database_assets()
+            except PersistenceError:
+                connection.close()
+                raise
         return connection
+
+    def _bootstrap_read_only(self) -> int:
+        """Read the existing schema contract without migration or DDL."""
+
+        connection = self._connect()
+        try:
+            try:
+                integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0]).lower()
+                journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+                row = connection.execute(
+                    "SELECT version FROM schema_meta WHERE schema_name = 'director'"
+                ).fetchone()
+            except sqlite3.DatabaseError as exc:
+                raise PersistenceCorruptError("SQLite read-only schema inspection failed") from exc
+            if integrity != "ok" or journal_mode != "wal" or row is None:
+                raise PersistenceCorruptError("SQLite read-only schema is unavailable")
+            try:
+                version = int(row[0])
+            except (TypeError, ValueError) as exc:
+                raise PersistenceCorruptError("SQLite read-only schema version is invalid") from exc
+            if version < 1 or version > CURRENT_SCHEMA_VERSION:
+                raise PersistenceCorruptError("SQLite read-only schema version is unsupported")
+            self._readonly_roots_schema = inspect_readonly_roots_schema(
+                connection,
+                allow_missing=True,
+                require_indexes=True,
+                scope_path=self.path,
+            )
+            if connection.execute("PRAGMA foreign_key_check").fetchall():
+                raise PersistenceCorruptError("SQLite read-only foreign key validation failed")
+            return version
+        finally:
+            connection.close()
 
     def _restrict_database_assets(self) -> None:
         """Keep the database and every SQLite sidecar private to this user."""
@@ -2053,6 +2171,8 @@ class SqliteDirectorStore:
 
     @contextmanager
     def _transaction(self, *, write: bool) -> Iterator[sqlite3.Connection]:
+        if write and self._read_only:
+            raise PersistenceError("SQLite store is read-only")
         with self._lock:
             connection = self._connect()
             try:
@@ -3221,6 +3341,66 @@ class SqliteDirectorStore:
             raise PersistenceError("lease state is invalid")
         lease = _identifier(lease_id, name="lease_id")
         self.run_write(lambda conn: conn.execute("UPDATE writer_leases SET state = ?, released_at = COALESCE(?, released_at) WHERE lease_id = ?", (state, released_at, lease)))
+
+    def release_expired_lease(
+        self,
+        lease_id: str,
+        *,
+        expected_workspace_id: str,
+        expected_working_tree_id: str,
+        expected_task_id: str,
+        expected_owner_id: str,
+        expected_expires_at: float,
+        now: float,
+    ) -> bool:
+        """Release one expired lease only when its pinned identity is unchanged.
+
+        This is the persistence-side CAS used by the native operator.  The
+        operator never issues SQL; keeping the compare-and-update here makes
+        the expiry check atomic with the durable state transition.
+        """
+
+        parsed_lease = _identifier(lease_id, name="lease_id")
+        workspace = _identifier(expected_workspace_id, name="workspace_id")
+        working_tree = _text(expected_working_tree_id, name="working_tree_id", maximum=256)
+        task_id = _text(expected_task_id, name="task_id", maximum=256)
+        owner = _identifier(expected_owner_id, name="owner_id")
+        expiry = _finite_number(expected_expires_at, name="expected_expires_at")
+        current_time = _finite_number(now, name="now")
+        released_at = current_time
+
+        def write(connection: sqlite3.Connection) -> bool:
+            row = connection.execute(
+                "SELECT workspace_id, working_tree_id, task_id, owner_id, expires_at, state "
+                "FROM writer_leases WHERE lease_id = ?",
+                (parsed_lease,),
+            ).fetchone()
+            if row is None:
+                raise PersistenceError("lease is unavailable")
+            stored_task = "" if row[2] is None else str(row[2])
+            stored_expiry = _finite_number(row[4], name="stored_expires_at")
+            if (
+                str(row[0]) != workspace
+                or str(row[1]) != working_tree
+                or stored_task != task_id
+                or str(row[3]) != owner
+                or stored_expiry != expiry
+            ):
+                raise PersistenceError("lease identity changed")
+            if str(row[5]) in _TERMINAL_LEASE_STATES:
+                return False
+            if str(row[5]) != "active":
+                raise PersistenceError("lease is not active")
+            if stored_expiry > current_time:
+                raise PersistenceError("lease has not expired")
+            connection.execute(
+                "UPDATE writer_leases SET state = 'released', released_at = ? "
+                "WHERE lease_id = ? AND state = 'active' AND expires_at <= ?",
+                (released_at, parsed_lease, current_time),
+            )
+            return True
+
+        return bool(self.run_write(write))
 
     def load_leases(self) -> list[dict[str, Any]]:
         with self._transaction(write=False) as connection:
@@ -4790,6 +4970,240 @@ class SqliteDirectorStore:
             item["external_execution"] = False
             result.append(item)
         return result
+
+    def get_acceleration_receipt(self, receipt_id: str) -> dict[str, Any] | None:
+        """Read one bounded acceleration receipt without changing its state."""
+
+        identifier = _identifier(receipt_id, name="receipt_id")
+        with self._transaction(write=False) as connection:
+            row = connection.execute(
+                "SELECT * FROM acceleration_receipts WHERE receipt_id = ?",
+                (identifier,),
+            ).fetchone()
+        return self._decode_acceleration_receipt_row(row) if row is not None else None
+
+    @staticmethod
+    def _operator_receipt_metadata_safe(value: object) -> bool:
+        """Reject raw operator inputs and secrets at the persistence boundary."""
+
+        denied_keys = {
+            "args",
+            "arguments",
+            "raw_args",
+            "raw_arguments",
+            "patch",
+            "patch_content",
+            "command_output",
+            "approval_token",
+            "token",
+            "credential",
+            "credentials",
+            "secret",
+            "password",
+        }
+        if isinstance(value, Mapping):
+            return all(
+                str(key).casefold() not in denied_keys
+                and SqliteDirectorStore._operator_receipt_metadata_safe(item)
+                for key, item in value.items()
+            )
+        if isinstance(value, (list, tuple)):
+            return all(SqliteDirectorStore._operator_receipt_metadata_safe(item) for item in value)
+        return True
+
+    @staticmethod
+    def _operator_receipt_values(record: object) -> tuple[tuple[object, ...], dict[str, Any]]:
+        value = _mapping(record, name="operator receipt")
+        allowed = {
+            "receipt_id",
+            "kind",
+            "subject_id",
+            "reason",
+            "evidence_hashes",
+            "refs",
+            "metadata",
+            "created_at",
+            "external_execution",
+        }
+        if set(value) - allowed:
+            raise PersistenceError("operator receipt contains non-persistable fields")
+        if value.get("kind") != "operator":
+            raise PersistenceError("operator receipt kind is invalid")
+        metadata = value.get("metadata")
+        if not isinstance(metadata, Mapping) or not SqliteDirectorStore._operator_receipt_metadata_safe(metadata):
+            raise PersistenceError("operator receipt metadata contains raw input or sensitive fields")
+        if set(str(key) for key in metadata) - _OPERATOR_RECEIPT_METADATA_FIELDS:
+            raise PersistenceError("operator receipt metadata contains an unsupported field")
+        if any(
+            not isinstance(item, (str, bool, int, float))
+            or (isinstance(item, float) and not math.isfinite(item))
+            for item in metadata.values()
+        ):
+            raise PersistenceError("operator receipt metadata values must be scalar")
+        record_type = metadata.get("record_type")
+        if record_type not in {"preflight", "claim", "outcome"}:
+            raise PersistenceError("operator receipt record type is invalid")
+        raw_hashes = value.get("evidence_hashes", [])
+        raw_refs = value.get("refs", [])
+        if (
+            not isinstance(raw_hashes, (list, tuple))
+            or not isinstance(raw_refs, (list, tuple))
+            or len(raw_hashes) > 32
+            or len(raw_refs) > 32
+        ):
+            raise PersistenceError("operator receipt evidence is invalid")
+        hashes = [_hash(item, name="operator_evidence_hash", allow_empty=False) for item in raw_hashes]
+        refs = [_text(item, name="operator_ref", maximum=512, allow_empty=False) for item in raw_refs]
+        normalized_metadata = dict(metadata)
+        metadata_json = _json(
+            normalized_metadata,
+            name="operator_metadata",
+            default={},
+            reject_forbidden_text=True,
+        )
+        values = (
+            _identifier(value.get("receipt_id"), name="receipt_id"),
+            "operator",
+            _identifier(value.get("subject_id"), name="subject_id"),
+            _text(value.get("reason"), name="operator_reason", maximum=400, allow_empty=False),
+            _json(sorted(hashes), name="operator_evidence_hashes", default=[]),
+            _json(sorted(refs), name="operator_refs", default=[]),
+            metadata_json,
+            _text(value.get("created_at"), name="created_at", maximum=128, allow_empty=False),
+        )
+        return values, {
+            "receipt_id": values[0],
+            "kind": values[1],
+            "subject_id": values[2],
+            "reason": values[3],
+            "evidence_hashes": sorted(hashes),
+            "refs": sorted(refs),
+            "metadata": normalized_metadata,
+            "created_at": values[7],
+            "external_execution": False,
+        }
+
+    @staticmethod
+    def _decode_acceleration_receipt_row(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+        item = _row_dict(row)
+        item["evidence_hashes"] = _decode(item.pop("evidence_hashes_json"), name="acceleration_evidence_hashes")
+        item["refs"] = _decode(item.pop("refs_json"), name="acceleration_refs")
+        item["metadata"] = _decode(item.pop("metadata_json"), name="acceleration_metadata")
+        item["external_execution"] = False
+        return item
+
+    def save_operator_receipt(self, value: object) -> None:
+        """Persist one immutable external-operator receipt in schema 14 storage.
+
+        The operator deliberately reuses ``acceleration_receipts`` instead of
+        creating a second state database.  The record type and metadata
+        allowlist keep audit evidence bounded and prevent raw CLI input from
+        crossing this boundary.
+        """
+
+        values, _normalized = self._operator_receipt_values(value)
+
+        def write(connection: sqlite3.Connection) -> None:
+            existing = connection.execute(
+                "SELECT receipt_id, kind, subject_id, reason, evidence_hashes_json, refs_json, metadata_json, created_at "
+                "FROM acceleration_receipts WHERE receipt_id = ?",
+                (values[0],),
+            ).fetchone()
+            if existing is not None:
+                existing_values = tuple(existing[index] for index in range(len(values)))
+                if existing_values != values:
+                    raise IdempotencyConflict("OPERATOR_RECEIPT_CONFLICT")
+                return
+            connection.execute(
+                "INSERT INTO acceleration_receipts(receipt_id, kind, subject_id, reason, evidence_hashes_json, refs_json, metadata_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                values,
+            )
+
+        self.run_write(write)
+
+    def get_operator_receipt(self, receipt_id: str) -> dict[str, Any] | None:
+        identifier = _identifier(receipt_id, name="receipt_id")
+        with self._transaction(write=False) as connection:
+            row = connection.execute(
+                "SELECT * FROM acceleration_receipts WHERE receipt_id = ? AND kind = 'operator'",
+                (identifier,),
+            ).fetchone()
+        return self._decode_acceleration_receipt_row(row) if row is not None else None
+
+    @staticmethod
+    def _operator_marker_id(kind: str, receipt_id: str) -> str:
+        return f"operator:{kind}:{receipt_id}"
+
+    def get_operator_outcome(self, preflight_id: str) -> dict[str, Any] | None:
+        return self.get_operator_receipt(self._operator_marker_id("outcome", _identifier(preflight_id, name="receipt_id")))
+
+    def claim_operator_receipt(
+        self,
+        receipt_id: str,
+        *,
+        actor: str,
+        claimed_at: float | None = None,
+    ) -> dict[str, Any]:
+        """Atomically claim a preflight exactly once across operator processes."""
+
+        preflight_id = _identifier(receipt_id, name="receipt_id")
+        actor_id = _identifier(actor, name="actor")
+        timestamp = _utc_now() if claimed_at is None else datetime.fromtimestamp(
+            _finite_number(claimed_at, name="claimed_at"), tz=timezone.utc
+        ).isoformat().replace("+00:00", "Z")
+        claim_id = self._operator_marker_id("claim", preflight_id)
+        outcome_id = self._operator_marker_id("outcome", preflight_id)
+
+        def write(connection: sqlite3.Connection) -> dict[str, Any]:
+            preflight = connection.execute(
+                "SELECT * FROM acceleration_receipts WHERE receipt_id = ? AND kind = 'operator'",
+                (preflight_id,),
+            ).fetchone()
+            if preflight is None:
+                raise PersistenceError("operator preflight receipt is unavailable")
+            preflight_item = self._decode_acceleration_receipt_row(preflight)
+            if preflight_item.get("metadata", {}).get("record_type") != "preflight":
+                raise PersistenceError("operator receipt is not a preflight")
+            outcome = connection.execute(
+                "SELECT * FROM acceleration_receipts WHERE receipt_id = ? AND kind = 'operator'",
+                (outcome_id,),
+            ).fetchone()
+            if outcome is not None:
+                return {
+                    "status": "completed",
+                    "receipt_id": preflight_id,
+                    "outcome": self._decode_acceleration_receipt_row(outcome),
+                }
+            claimed = connection.execute(
+                "SELECT * FROM acceleration_receipts WHERE receipt_id = ? AND kind = 'operator'",
+                (claim_id,),
+            ).fetchone()
+            if claimed is not None:
+                return {"status": "already_claimed", "receipt_id": preflight_id}
+            claim_record = {
+                "receipt_id": claim_id,
+                "kind": "operator",
+                "subject_id": str(preflight_item["subject_id"]),
+                "reason": "external operator preflight claim",
+                "evidence_hashes": list(preflight_item.get("evidence_hashes", [])),
+                "refs": [],
+                "metadata": {
+                    "record_type": "claim",
+                    "preflight_id": preflight_id,
+                    "actor": actor_id,
+                },
+                "created_at": timestamp,
+            }
+            claim_values, _normalized = self._operator_receipt_values(claim_record)
+            connection.execute(
+                "INSERT INTO acceleration_receipts(receipt_id, kind, subject_id, reason, evidence_hashes_json, refs_json, metadata_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                claim_values,
+            )
+            return {"status": "claimed", "receipt_id": preflight_id, "claim_id": claim_id}
+
+        return self.run_write(write)
 
     def save_context_checkpoint(self, value: object) -> None:
         record = _mapping(value, name="context checkpoint")
