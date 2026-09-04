@@ -12,6 +12,9 @@ class DirectorMcpIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory(prefix="chatgpt-dev-mcp-director-")
         self.root = Path(self.tempdir.name)
+        self.home = self.root / "home"
+        self.discovery_root = self.home / "Developer"
+        self.discovery_root.mkdir(parents=True)
         self.repo = self.root / "repo"
         self.repo.mkdir()
         (self.repo / "README.md").write_text('token=secret-value\nhello\n', encoding="utf-8")
@@ -28,7 +31,7 @@ class DirectorMcpIntegrationTests(unittest.TestCase):
                     "roots": [
                         {
                             "id": "developer",
-                            "path": str(Path(__file__).resolve().parents[1]),
+                            "path": str(self.discovery_root),
                             "mode": "PROJECT_DISCOVERY",
                         }
                     ],
@@ -43,6 +46,8 @@ class DirectorMcpIntegrationTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        self.previous_home = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.home)
         self.previous_config = os.environ.get("LOCAL_DEV_MCP_CONFIG")
         os.environ["LOCAL_DEV_MCP_CONFIG"] = str(self.config)
 
@@ -51,6 +56,10 @@ class DirectorMcpIntegrationTests(unittest.TestCase):
             os.environ.pop("LOCAL_DEV_MCP_CONFIG", None)
         else:
             os.environ["LOCAL_DEV_MCP_CONFIG"] = self.previous_config
+        if self.previous_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self.previous_home
         self.tempdir.cleanup()
 
     def _runtime(self):

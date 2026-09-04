@@ -112,7 +112,11 @@ class PolicyTests(unittest.TestCase):
         from chatgpt_dev_mcp.server import WrapperRuntime, load_registry
 
         with tempfile.TemporaryDirectory(prefix="chatgpt-dev-mcp-metadata-") as temp:
-            root = Path(temp) / "repo"
+            temp_root = Path(temp)
+            home = temp_root / "home"
+            discovery_root = home / "Developer"
+            discovery_root.mkdir(parents=True)
+            root = temp_root / "repo"
             root.mkdir()
             (root / "README.md").write_text("fixture\n", encoding="utf-8")
             config = Path(temp) / "config.json"
@@ -123,7 +127,7 @@ class PolicyTests(unittest.TestCase):
                         "roots": [
                             {
                                 "id": "developer",
-                                "path": str(Path(__file__).resolve().parents[1]),
+                                "path": str(discovery_root),
                                 "mode": "PROJECT_DISCOVERY",
                             }
                         ],
@@ -146,7 +150,9 @@ class PolicyTests(unittest.TestCase):
                 encoding="utf-8",
             )
             previous = os.environ.get("LOCAL_DEV_MCP_CONFIG")
+            previous_home = os.environ.get("HOME")
             os.environ["LOCAL_DEV_MCP_CONFIG"] = str(config)
+            os.environ["HOME"] = str(home)
             try:
                 _, entries, _, errors = load_registry()
                 self.assertEqual(errors, [])
@@ -164,6 +170,10 @@ class PolicyTests(unittest.TestCase):
                     os.environ.pop("LOCAL_DEV_MCP_CONFIG", None)
                 else:
                     os.environ["LOCAL_DEV_MCP_CONFIG"] = previous
+                if previous_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = previous_home
 
     def test_project_metadata_rejects_unknown_keys_and_unsafe_paths(self) -> None:
         from chatgpt_dev_mcp.server import load_registry
