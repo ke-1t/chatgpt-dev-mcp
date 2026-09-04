@@ -120,12 +120,13 @@ jobs:
           path = Path("tests/test_http_transport.py")
           text = path.read_text(encoding="utf-8")
           old = '        self.assertEqual(doctor["result"]["structuredContent"]["failure_class"], "HEALTHY")\n'
-          new = '''        diagnosis = doctor["result"]["structuredContent"]
-          self.assertIn(diagnosis["failure_class"], {"HEALTHY", "TUNNEL_UNAVAILABLE"})
-          if diagnosis["failure_class"] == "TUNNEL_UNAVAILABLE":
-              self.assertEqual(diagnosis["evidence"]["tunnel_status"], "unavailable")
-              self.assertIn("recover_local_tunnel", diagnosis["recommended_actions"])
-          '''
+          new = (
+              '        diagnosis = doctor["result"]["structuredContent"]\n'
+              '        self.assertIn(diagnosis["failure_class"], {"HEALTHY", "TUNNEL_UNAVAILABLE"})\n'
+              '        if diagnosis["failure_class"] == "TUNNEL_UNAVAILABLE":\n'
+              '            self.assertEqual(diagnosis["evidence"]["tunnel_status"], "unavailable")\n'
+              '            self.assertIn("recover_local_tunnel", diagnosis["recommended_actions"])\n'
+          )
           if text.count(old) != 1:
               raise SystemExit("expected unique v26 doctor assertion was not found")
           path.write_text(text.replace(old, new, 1), encoding="utf-8")
@@ -150,6 +151,7 @@ jobs:
           .venv311/bin/python -m pip install -e .
           .venv311/bin/python -m compileall -q src tests/test_policy.py tests/test_http_transport.py
           .venv311/bin/python scripts/verify_fast.py
+          .venv311/bin/python -m unittest tests.test_http_transport.HttpTransportTests.test_v26_canary_endpoint_advertises_distinct_narrow_surface
           .venv311/bin/python -m unittest discover -s tests
 
       - uses: actions/setup-python@v5
@@ -165,6 +167,7 @@ jobs:
           .venv313/bin/python -m pip install -e .
           .venv313/bin/python -m compileall -q src tests/test_policy.py tests/test_http_transport.py
           .venv313/bin/python scripts/verify_fast.py
+          .venv313/bin/python -m unittest tests.test_http_transport.HttpTransportTests.test_v26_canary_endpoint_advertises_distinct_narrow_surface
           .venv313/bin/python -m unittest discover -s tests
 
       - name: Commit assembled repair
