@@ -1,0 +1,83 @@
+name: Assemble CI repair
+
+on:
+  push:
+    branches: [fix/ci-python311-evidence-import]
+
+permissions:
+  contents: write
+
+jobs:
+  assemble-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble canonical source modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in \
+            candidate_preparation \
+            runtime_activation \
+            session_state_reconciliation \
+            session_identity_repair \
+            legacy_worktree_adoption \
+            session_retained_evidence
+          do
+            parts=(.ci-sync/${name}.py.part*)
+            test -e "${parts[0]}"
+            cat "${parts[@]}" > "src/chatgpt_dev_mcp/${name}.py"
+          done
+
+          test "$(git hash-object src/chatgpt_dev_mcp/candidate_preparation.py)" = "9bfc76275a4adad19129216e50cbf225ec992461"
+          test "$(git hash-object src/chatgpt_dev_mcp/runtime_activation.py)" = "942ce9cfb2be72c1549564c83cdaee2afe0c2b26"
+          test "$(git hash-object src/chatgpt_dev_mcp/session_state_reconciliation.py)" = "1180a070e6d4ec6f8dc2334dd3d1f74e883b7ff6"
+          test "$(git hash-object src/chatgpt_dev_mcp/session_identity_repair.py)" = "3ad51c650eb52856860bbc58bae8bd4f2b3426a9"
+          test "$(git hash-object src/chatgpt_dev_mcp/legacy_worktree_adoption.py)" = "224872cd793c9e101b0407d055a7c3a812a5105d"
+          test "$(git hash-object src/chatgpt_dev_mcp/session_retained_evidence.py)" = "8dcac73f42dd74b8a3d2876e7b49bcfd3c4293d0"
+          test "$(git hash-object src/chatgpt_dev_mcp/evidence_generation_import.py)" = "0d97623f3dffbf8953ae37f519b006a4bea8987a"
+          test "$(git hash-object src/chatgpt_dev_mcp/server.py)" = "7958c7460589b70f35d7de4aee4947cc81833f13"
+
+          rm -rf .ci-sync
+          rm .github/workflows/assemble-ci-repair.yml
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify Python 3.11
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .venv311
+          .venv311/bin/python -m pip install --upgrade pip
+          .venv311/bin/python -m pip install -e .
+          .venv311/bin/python scripts/verify_fast.py
+          .venv311/bin/python -m unittest discover -s tests
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Verify Python 3.13
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .venv313
+          .venv313/bin/python -m pip install --upgrade pip
+          .venv313/bin/python -m pip install -e .
+          .venv313/bin/python scripts/verify_fast.py
+          .venv313/bin/python -m unittest discover -s tests
+
+      - name: Commit assembled repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m 'Assemble canonical CI repair sources'
+          git push origin HEAD:${GITHUB_REF_NAME}
