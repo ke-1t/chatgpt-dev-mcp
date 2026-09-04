@@ -1,0 +1,150 @@
+"""Prepare immutable v26 candidate and recovery artifacts.
+
+This module is deliberately narrower than activation.  It accepts only the
+server-owned canonical workspace and, when applicable, existing integration
+receipts, builds a clean detached artifact from either an exact tracked patch
+or an exact committed HEAD, and records bounded
+readiness evidence.  It never changes the canonical checkout, production
+deployment, production database, LaunchAgent, or activation state.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import sqlite3
+import stat
+import tempfile
+from typing import Any, Callable, Mapping, Sequence
+
+from .connector_resilience import persistence_db_identity
+from .persistence import PersistenceError, inspect_readonly_roots_schema
+from .process_runner import run_bounded
+
+
+V26_SCHEMA_VERSION = 14
+EXPECTED_V26_TOOL_COUNT = 76
+MANIFEST_NAME = ".v26-candidate-manifest.json"
+ENTRYPOINT_LOCATOR = "src/chatgpt_dev_mcp/http_entrypoint.py"
+MAX_PATCH_BYTES = 512 * 1024
+MAX_OUTPUT_BYTES = 2 * 1024 * 1024
+MAX_PATHS = 64
+MAX_PATH_BYTES = 512
+MAX_INTEGRATION_RECEIPTS = 8
+_HEX40 = re.compile(r"^[0-9a-f]{40}$")
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_WORKSPACE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
+_SOURCE_MODES = frozenset({"integrated_patch", "committed_head"})
+_EMPTY_PATCH_HASH = hashlib.sha256(b"").hexdigest()
+_SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+_RETAINED_CHECKOUT_MARKERS = frozenset(
+    {"development", "reconciliation", "frozen", "reference", "disposable"}
+)
+
+
+class CandidatePreparationError(RuntimeError):
+    """A source, artifact, receipt, or role boundary failed closed."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = dict(details or {})
+
+
+@dataclass(frozen=True)
+class PythonRuntimeIdentity:
+    locator: Path
+    resolved: Path
+    digest: str
+    version: str
+
+
+@dataclass(frozen=True)
+class CandidatePreparationRequest:
+    workspace_id: str
+    source_mode: str
+    expected_base_revision: str
+    expected_patch_hash: str
+    permitted_paths: tuple[str, ...]
+    integration_receipt_groups: tuple[tuple[str, tuple[str, ...]], ...]
+    expected_bootstrap_contract: str
+    expected_schema_version: int
+    expected_tool_count: int
+    expected_tool_schema_hash: str
+    artifact_role: str
+
+    @classmethod
+    def from_params(cls, params: Mapping[str, Any]) -> "CandidatePreparationRequest":
+        if not isinstance(params, Mapping):
+            raise CandidatePreparationError(
+                "CANDIDATE_PREPARATION_ARGUMENT_INVALID",
+                "candidate preparation parameters must be an object",
+            )
+
+        def text(name: str, maximum: int = 256) -> str:
+            value = params.get(name)
+            if not isinstance(value, str) or not value or len(value.encode("utf-8")) > maximum:
+                raise CandidatePreparationError(
+                    "CANDIDATE_PREPARATION_ARGUMENT_INVALID",
+                    f"{name} is invalid",
+                )
+            return value
+
+        workspace_id = text("workspace_id")
+        if not _WORKSPACE_ID.fullmatch(workspace_id):
+            raise CandidatePreparationError(
+                "CANDIDATE_PREPARATION_ARGUMENT_INVALID",
+                "workspace_id has an invalid format",
+            )
+        source_mode = params.get("source_mode", "integrated_patch")
+        if not isinstance(source_mode, str) or source_mode not in _SOURCE_MODES:
+            raise CandidatePreparationError(
+                "CANDIDATE_SOURCE_MODE_INVALID",
+                "source_mode must be integrated_patch or committed_head",
+            )
+        base = text("expected_base_revision", 40).lower()
+        patch_hash = text("expected_patch_hash", 64).lower()
+        if not _HEX40.fullmatch(base):
+            raise CandidatePreparationError(
+                "CANDIDATE_PREPARATION_BASE_INVALID",
+                "expected_base_revision must be a full Git revision",
+            )
+        if not _HEX64.fullmatch(patch_hash):
+            raise CandidatePreparationError(
+                "CANDIDATE_PREPARATION_PATCH_INVALID",
+                "expected_patch_hash must be a SHA-256 digest",
+            )
+        raw_paths = params.get("permitted_paths")
+        if source_mode == "committed_head":
+            if not isinstance(raw_paths, (list, tuple)) or raw_paths:
+                raise CandidatePreparationError(
+                    "CANDIDATE_COMMITTED_HEAD_CONTRACT_INVALID",
+                    "committed_head requires an empty permitted_paths list",
+                )
+            paths = ()
+        else:
+            if not isinstance(raw_paths, (list, tuple)) or not raw_paths or len(raw_paths) > MAX_PATHS:
+                raise CandidatePreparationError(
+                    "CANDIDATE_PREPARATION_PATHS_INVALID",
+                    "permitted_paths must contain a bounded non-empty list",
+                )
+            paths = tuple(sorted({_normalize_relative_path(item) for item in raw_paths}))
+            if len(paths) != len(raw_paths):
+                raise CandidatePreparationError(
+                    "CANDIDATE_PREPARATION_PATHS_INVALID",
+                    "permitted_paths must be unique",
+                )
+        raw_receipts = params.get("integration_receipts")
