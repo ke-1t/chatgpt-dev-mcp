@@ -39,10 +39,54 @@ jobs:
             done
           done
 
-          # The two directly repaired files must still be byte-identical to the
-          # reviewed branch versions. The staged canonical modules are validated
-          # below by compile + fast verification + full suites on both supported
-          # Python versions before anything is committed.
+          cat >> src/chatgpt_dev_mcp/session_state_reconciliation.py <<'PY'
+
+          if snapshot.git_metadata_state not in MISSING_GIT_STATES and not snapshot.git_metadata_prunable:
+              return ReconciliationPlan(snapshot, UNKNOWN, "", (), ("GIT_METADATA_NOT_MISSING_OR_PRUNABLE",), snapshot.state_digest)
+          actions.extend(("preserve_sidecar_evidence", "tombstone_missing_worktree", "transition_cleanup_candidate"))
+          reasons.append("MISSING_IS_NOT_SUCCESS")
+          if snapshot.root_kind == "legacy":
+              reasons.append("LEGACY_ROOT_NONLIVE")
+          return ReconciliationPlan(
+              snapshot,
+              RECONCILABLE_MISSING_WORKTREE,
+              "cleanup_candidate",
+              tuple(actions),
+              tuple(reasons),
+              snapshot.state_digest,
+          )
+
+
+      def reconciliation_receipt_id(session_id: str, state_digest: str) -> str:
+          if not SESSION_ID_PATTERN.fullmatch(session_id) or len(state_digest) != 64:
+              raise ReconciliationError("reconciliation receipt identity is invalid")
+          return f"reconciliation:{session_id}:{state_digest}"
+
+
+      __all__ = [
+          "ALREADY_TERMINAL",
+          "BLOCKED",
+          "LEGACY_ROOTS_ENV",
+          "MAX_EVIDENCE_JSON_BYTES",
+          "MAX_SIDECAR_BYTES",
+          "RECONCILABLE_MISSING_WORKTREE",
+          "RECONCILABLE_PRESERVE_WORKTREE",
+          "ReconciliationError",
+          "ReconciliationPlan",
+          "ReconciliationSnapshot",
+          "RootDecision",
+          "SidecarRecord",
+          "UNKNOWN",
+          "canonical_json",
+          "classify_reconciliation_snapshot",
+          "configured_legacy_roots",
+          "evidence_digest",
+          "reconciliation_receipt_id",
+          "resolve_allowlisted_root",
+          "read_registered_sidecars",
+      ]
+      PY
+
           test "$(git hash-object src/chatgpt_dev_mcp/evidence_generation_import.py)" = "0d97623f3dffbf8953ae37f519b006a4bea8987a"
           test "$(git hash-object src/chatgpt_dev_mcp/server.py)" = "7958c7460589b70f35d7de4aee4947cc81833f13"
 
