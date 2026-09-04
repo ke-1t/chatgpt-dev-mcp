@@ -1,0 +1,150 @@
+        object.__setattr__(self, "untracked_manifest", normalized_manifest)
+        if self.sidecar_bytes is not None:
+            if not isinstance(self.sidecar_bytes, bytes):
+                raise ReconciliationError("sidecar_bytes must be bytes")
+            if len(self.sidecar_bytes) > MAX_SIDECAR_BYTES:
+                raise ReconciliationError("sidecar_bytes exceeds the safety bound")
+            if self.sidecar_digest and hashlib.sha256(self.sidecar_bytes).hexdigest() != self.sidecar_digest:
+                raise ReconciliationError("sidecar_digest does not match sidecar_bytes")
+
+    def evidence(self) -> dict[str, Any]:
+        """Return digestable evidence without embedding raw sidecar bytes."""
+
+        return {
+            "schema_version": RECONCILIATION_SCHEMA_VERSION,
+            "session_id": self.session_id,
+            "workspace_id": self.workspace_id,
+            "lifecycle_state": self.lifecycle_state,
+            "stale": bool(self.stale),
+            "expired": bool(self.expired),
+            "sidecar_state": self.sidecar_state,
+            "sidecar_root": self.sidecar_root,
+            "sidecar_path": self.sidecar_path,
+            "sidecar_digest": self.sidecar_digest,
+            "sidecar_updated_at": self.sidecar_updated_at,
+            "worktree_path": self.worktree_path,
+            "worktree_id": self.worktree_id,
+            "worktree_exists": bool(self.worktree_exists),
+            "worktree_dirty": bool(self.worktree_dirty),
+            "worktree_head": self.worktree_head,
+            "worktree_branch": self.worktree_branch,
+            "worktree_device": self.worktree_device,
+            "worktree_inode": self.worktree_inode,
+            "tracked_diff_digest": self.tracked_diff_digest,
+            "untracked_manifest": [dict(item) for item in self.untracked_manifest],
+            "untracked_digest": self.untracked_digest,
+            "index_clean": bool(self.index_clean),
+            "source_revision": self.source_revision,
+            "source_path": self.source_path,
+            "source_device": self.source_device,
+            "source_inode": self.source_inode,
+            "git_metadata_state": self.git_metadata_state,
+            "git_metadata_prunable": bool(self.git_metadata_prunable),
+            "task_state": dict(self.task_state),
+            "lease_state": dict(self.lease_state),
+            "process_state": dict(self.process_state),
+            "archive_state": dict(self.archive_state),
+            "sqlite_state": dict(self.sqlite_state),
+            "session_metadata": dict(self.session_metadata),
+            "evidence_conflicts": list(self.evidence_conflicts),
+            "active_live_session": bool(self.active_live_session),
+            "root_allowlisted": bool(self.root_allowlisted),
+            "root_kind": self.root_kind,
+            "authority_known": bool(self.authority_known),
+            "source_identity_verified": bool(self.source_identity_verified),
+            "worktree_identity_verified": bool(self.worktree_identity_verified),
+            "dirty_preservable": bool(self.dirty_preservable),
+            "source_provenance_verified": bool(self.source_provenance_verified),
+        }
+
+    @property
+    def state_digest(self) -> str:
+        return evidence_digest(self.evidence())
+
+
+@dataclass(frozen=True)
+class ReconciliationPlan:
+    snapshot: ReconciliationSnapshot
+    classification: str
+    proposed_transition: str
+    preservation_actions: tuple[str, ...]
+    reason_codes: tuple[str, ...]
+    state_digest: str
+
+    def as_dict(self, *, include_sidecar_bytes: bool = False) -> dict[str, Any]:
+        result = {
+            "capability_id": RECONCILIATION_CAPABILITY_ID,
+            "schema_version": RECONCILIATION_SCHEMA_VERSION,
+            "session_id": self.snapshot.session_id,
+            "workspace_id": self.snapshot.workspace_id,
+            "classification": self.classification,
+            "current_lifecycle": self.snapshot.lifecycle_state,
+            "proposed_transition": self.proposed_transition,
+            "preservation_actions": list(self.preservation_actions),
+            "reason_codes": list(self.reason_codes),
+            "state_digest": self.state_digest,
+            "evidence": self.snapshot.evidence(),
+        }
+        if include_sidecar_bytes and self.snapshot.sidecar_bytes is not None:
+            result["sidecar_bytes"] = self.snapshot.sidecar_bytes
+        return result
+
+
+@dataclass(frozen=True)
+class RootDecision:
+    allowed: bool
+    kind: str
+    root: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class SidecarRecord:
+    """Raw registered sidecar evidence before any lifecycle interpretation."""
+
+    path: str
+    session_id: str
+    payload: Mapping[str, Any]
+    raw_bytes: bytes
+    digest: str
+    updated_at: str
+
+
+def read_registered_sidecars(
+    sidecar_root: str | os.PathLike[str],
+    *,
+    session_id: str | None = None,
+) -> tuple[SidecarRecord, ...]:
+    """Read sidecars only from the current, DevMCP-registered sidecar root.
+
+    Legacy worktree roots are represented by a sidecar's stored ``worktree_path``;
+    this function never scans those roots or any caller-provided arbitrary tree.
+    """
+
+    root = Path(sidecar_root).expanduser()
+    if session_id is not None and not SESSION_ID_PATTERN.fullmatch(session_id):
+        return ()
+    if not root.is_absolute() or root.is_symlink() or not root.is_dir():
+        return ()
+    candidates = [root / f"{session_id.removeprefix('session:')}.json"] if session_id else sorted(root.glob("*.json"))
+    records: list[SidecarRecord] = []
+    for path in candidates:
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_SIDECAR_BYTES:
+                continue
+            raw = path.read_bytes()
+            payload = json.loads(raw.decode("utf-8"))
+            sid = payload.get("session_id") if isinstance(payload, Mapping) else None
+            if not isinstance(sid, str) or not SESSION_ID_PATTERN.fullmatch(sid):
+                continue
+            if session_id is not None and sid != session_id:
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+            records.append(
+                SidecarRecord(
+                    path=str(path),
+                    session_id=sid,
+                    payload=dict(payload),
+                    raw_bytes=raw,
+                    digest=hashlib.sha256(raw).hexdigest(),
