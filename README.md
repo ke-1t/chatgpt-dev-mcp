@@ -43,7 +43,7 @@ This is a local development bridge, not proof of external marketplace/provider e
 The simplest reproducible installation uses `uv` and an isolated environment:
 
 ```sh
-git clone https://github.com/ke-1t/chatgpt-dev-mcp.git
+git clone https://github.com/ke-1t/chatgpt-dev-mcp.git chatgpt-dev-mcp
 cd chatgpt-dev-mcp
 uv venv .venv
 uv pip install -e .

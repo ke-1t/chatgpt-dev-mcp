@@ -13,7 +13,7 @@ Thank you for considering a contribution. This project is a thin, security-focus
 ## Development setup
 
 ```sh
-git clone https://github.com/ke-1t/chatgpt-dev-mcp.git
+git clone https://github.com/ke-1t/chatgpt-dev-mcp.git chatgpt-dev-mcp
 cd chatgpt-dev-mcp
 uv venv .venv
 uv pip install -e .
