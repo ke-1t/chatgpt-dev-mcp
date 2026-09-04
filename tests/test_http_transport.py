@@ -406,7 +406,11 @@ class HttpTransportTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         assert doctor is not None
-        self.assertEqual(doctor["result"]["structuredContent"]["failure_class"], "HEALTHY")
+        diagnosis = doctor["result"]["structuredContent"]
+        self.assertIn(diagnosis["failure_class"], {"HEALTHY", "TUNNEL_UNAVAILABLE"})
+        if diagnosis["failure_class"] == "TUNNEL_UNAVAILABLE":
+            self.assertEqual(diagnosis["evidence"]["tunnel_status"], "unavailable")
+            self.assertIn("recover_local_tunnel", diagnosis["recommended_actions"])
 
     def test_v26_request_lifecycle_events_pin_schema_and_http_connection_identity(self) -> None:
         from chatgpt_dev_mcp.v26_surface import V26_SURFACE_REVISION

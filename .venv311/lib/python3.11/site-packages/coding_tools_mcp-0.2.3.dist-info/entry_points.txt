@@ -1,0 +1,3 @@
+[console_scripts]
+coding-tools-mcp = coding_tools_mcp.server:main
+coding-tools-mcp-desktop = mcp_desktop_client.app:main
