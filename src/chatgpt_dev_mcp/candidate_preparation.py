@@ -712,6 +712,11 @@ def _copy_database(source: Path, destination: Path, *, expected_schema: int) -> 
         finally:
             destination_connection.close()
             source_connection.close()
+        # sqlite3 creates a new database using the process umask.  Candidate
+        # verification opens this snapshot through the private read-only
+        # persistence boundary, so make the snapshot private before any
+        # identity or integrity readback can accept it.
+        os.chmod(destination, 0o600)
         _inspect_database(destination, expected_schema=expected_schema)
         return persistence_db_identity(destination, schema_version=expected_schema)
     except CandidatePreparationError:
