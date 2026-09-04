@@ -1,0 +1,150 @@
+"""Fail-closed classification for retained DEVELOPMENT evidence.
+
+The normal stale-session reconciliation path requires an exact source identity
+match.  A moved canonical checkout can make that identity unverifiable while
+the Git source, revision history, and managed worktree are still independently
+provable.  This module describes the narrower, non-destructive path used to
+archive those bytes and terminalize their control-plane record without
+pretending that the old source identity was repaired.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Any, Mapping
+
+from .development import UNBORN_HEAD
+from .session_identity_repair import IdentityRepairObservation
+from .session_state_reconciliation import evidence_digest
+
+
+RETAINED_EVIDENCE_TERMINAL = "EVIDENCE_RETAINED_TERMINAL"
+RETAINED_EVIDENCE_ELIGIBLE = "RETAINED_EVIDENCE_ELIGIBLE"
+BLOCKED = "BLOCKED"
+UNKNOWN = "UNKNOWN"
+
+# Semantic disposition vocabulary (Phase 6).  A dirty retained session may only
+# be terminalized after its *meaning* is formally decided.  Blocked dispositions
+# keep unresolved dirty evidence from escaping into a terminal state; accepted
+# dispositions record an explicit owner decision so the bytes are never
+# silently classified.
+SEMANTIC_DISPOSITION_HISTORICAL_EVIDENCE = "HISTORICAL_EVIDENCE"
+SEMANTIC_DISPOSITION_SUPERSEDED_REFERENCE = "SUPERSEDED_REFERENCE_EVIDENCE"
+SEMANTIC_DISPOSITION_STALE_HISTORICAL_WORK = "STALE_HISTORICAL_WORK"
+SEMANTIC_DISPOSITION_ABANDONED_EXPERIMENT = "ABANDONED_EXPERIMENT"
+SEMANTIC_DISPOSITION_SUPERSEDED_BY_CANONICAL = "SUPERSEDED_BY_CANONICAL"
+SEMANTIC_DISPOSITION_ARCHIVE_CANDIDATE = "ARCHIVE_CANDIDATE"
+SEMANTIC_DISPOSITION_REBUILD_IN_FRESH_SESSION = "REBUILD_IN_FRESH_SESSION"
+
+SEMANTIC_DISPOSITION_ACTIVE_WORK = "ACTIVE_WORK"
+SEMANTIC_DISPOSITION_OWNER_DECISION_REQUIRED = "OWNER_DECISION_REQUIRED"
+SEMANTIC_DISPOSITION_VALID_UNINTEGRATED_WORK = "VALID_UNINTEGRATED_WORK"
+SEMANTIC_DISPOSITION_UNKNOWN = "UNKNOWN"
+
+_ACCEPTED_SEMANTIC_DISPOSITIONS = frozenset(
+    {
+        SEMANTIC_DISPOSITION_HISTORICAL_EVIDENCE,
+        SEMANTIC_DISPOSITION_SUPERSEDED_REFERENCE,
+        SEMANTIC_DISPOSITION_STALE_HISTORICAL_WORK,
+        SEMANTIC_DISPOSITION_ABANDONED_EXPERIMENT,
+        SEMANTIC_DISPOSITION_SUPERSEDED_BY_CANONICAL,
+        SEMANTIC_DISPOSITION_ARCHIVE_CANDIDATE,
+        SEMANTIC_DISPOSITION_REBUILD_IN_FRESH_SESSION,
+    }
+)
+_BLOCKED_SEMANTIC_DISPOSITIONS = frozenset(
+    {
+        SEMANTIC_DISPOSITION_ACTIVE_WORK,
+        SEMANTIC_DISPOSITION_OWNER_DECISION_REQUIRED,
+        SEMANTIC_DISPOSITION_VALID_UNINTEGRATED_WORK,
+        SEMANTIC_DISPOSITION_UNKNOWN,
+    }
+)
+_KNOWN_SEMANTIC_DISPOSITIONS = _ACCEPTED_SEMANTIC_DISPOSITIONS | _BLOCKED_SEMANTIC_DISPOSITIONS
+
+_COMMIT_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
+_ACTIVE_STATES = frozenset(
+    {
+        "active",
+        "running",
+        "attached",
+        "unknown",
+        "queued",
+        "ready",
+        "leased",
+        "verifying",
+        "review_ready",
+        "recovery",
+    }
+)
+_ALLOWED_TASK_STATES = frozenset({"succeeded", "failed", "cancelled", "blocked", "stale", "absent"})
+_ALLOWED_LEASE_STATES = frozenset({"released", "expired", "stale", "absent"})
+_RETAINABLE_SESSION_STATES = frozenset(
+    {
+        "stale",
+        "suspended",
+        "recoverable",
+        "expired_clean",
+        "expired_dirty_retained",
+        "stale_clean",
+        "stale_dirty_retained",
+        "cleanup_candidate",
+    }
+)
+
+
+def is_accepted_semantic_disposition(value: object) -> bool:
+    """Return whether an owner decision permits retained terminalization."""
+
+    return str(value or "").strip() in _ACCEPTED_SEMANTIC_DISPOSITIONS
+
+
+def is_blocked_semantic_disposition(value: object) -> bool:
+    """Return whether an owner decision explicitly keeps evidence blocked."""
+
+    return str(value or "").strip() in _BLOCKED_SEMANTIC_DISPOSITIONS
+
+
+def is_active_retained_state(value: object) -> bool:
+    """Return whether a lifecycle/task/process state is still live."""
+
+    return str(value or "").strip() in _ACTIVE_STATES
+
+
+def _is_unborn_head(value: object) -> bool:
+    return isinstance(value, str) and value.lower() == UNBORN_HEAD
+
+
+def _valid_commit(value: object) -> bool:
+    text = str(value or "")
+    return bool(_COMMIT_PATTERN.fullmatch(text)) and text.lower() != UNBORN_HEAD
+
+
+def _valid_retained_commit(value: object, *, allow_unborn: bool) -> bool:
+    return _valid_commit(value) or (allow_unborn and _is_unborn_head(value))
+
+
+def _valid_retained_identity(value: Mapping[str, Any], *, allow_unborn: bool) -> bool:
+    return bool(
+        isinstance(value.get("source_path"), str)
+        and value.get("source_path")
+        and isinstance(value.get("git_root"), str)
+        and value.get("git_root")
+        and isinstance(value.get("device"), int)
+        and not isinstance(value.get("device"), bool)
+        and isinstance(value.get("inode"), int)
+        and not isinstance(value.get("inode"), bool)
+        and _valid_retained_commit(value.get("head"), allow_unborn=allow_unborn)
+        and isinstance(value.get("git_marker"), str)
+        and bool(value.get("git_marker"))
+    )
+
+
+def _valid_identity(value: Mapping[str, Any]) -> bool:
+    return _valid_retained_identity(value, allow_unborn=False)
+
+
+@dataclass(frozen=True)
+class RetainedEvidencePlan:
+    """Pure decision for one evidence-preserving terminal transition."""
