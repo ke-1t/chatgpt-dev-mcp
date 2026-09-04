@@ -28,17 +28,29 @@ jobs:
           do
             parts=(.ci-sync/${name}.py.part*)
             test -e "${parts[0]}"
-            cat "${parts[@]}" > "src/chatgpt_dev_mcp/${name}.py"
+            : > "src/chatgpt_dev_mcp/${name}.py"
+            for part in "${parts[@]}"; do
+              cat "$part" >> "src/chatgpt_dev_mcp/${name}.py"
+              printf '\n' >> "src/chatgpt_dev_mcp/${name}.py"
+            done
           done
 
-          test "$(git hash-object src/chatgpt_dev_mcp/candidate_preparation.py)" = "9bfc76275a4adad19129216e50cbf225ec992461"
-          test "$(git hash-object src/chatgpt_dev_mcp/runtime_activation.py)" = "942ce9cfb2be72c1549564c83cdaee2afe0c2b26"
-          test "$(git hash-object src/chatgpt_dev_mcp/session_state_reconciliation.py)" = "1180a070e6d4ec6f8dc2334dd3d1f74e883b7ff6"
-          test "$(git hash-object src/chatgpt_dev_mcp/session_identity_repair.py)" = "3ad51c650eb52856860bbc58bae8bd4f2b3426a9"
-          test "$(git hash-object src/chatgpt_dev_mcp/legacy_worktree_adoption.py)" = "224872cd793c9e101b0407d055a7c3a812a5105d"
-          test "$(git hash-object src/chatgpt_dev_mcp/session_retained_evidence.py)" = "8dcac73f42dd74b8a3d2876e7b49bcfd3c4293d0"
-          test "$(git hash-object src/chatgpt_dev_mcp/evidence_generation_import.py)" = "0d97623f3dffbf8953ae37f519b006a4bea8987a"
-          test "$(git hash-object src/chatgpt_dev_mcp/server.py)" = "7958c7460589b70f35d7de4aee4947cc81833f13"
+          check_hash() {
+            path="$1"
+            expected="$2"
+            actual="$(git hash-object "$path")"
+            echo "$path $actual"
+            test "$actual" = "$expected"
+          }
+
+          check_hash src/chatgpt_dev_mcp/candidate_preparation.py 9bfc76275a4adad19129216e50cbf225ec992461
+          check_hash src/chatgpt_dev_mcp/runtime_activation.py 942ce9cfb2be72c1549564c83cdaee2afe0c2b26
+          check_hash src/chatgpt_dev_mcp/session_state_reconciliation.py 1180a070e6d4ec6f8dc2334dd3d1f74e883b7ff6
+          check_hash src/chatgpt_dev_mcp/session_identity_repair.py 3ad51c650eb52856860bbc58bae8bd4f2b3426a9
+          check_hash src/chatgpt_dev_mcp/legacy_worktree_adoption.py 224872cd793c9e101b0407d055a7c3a812a5105d
+          check_hash src/chatgpt_dev_mcp/session_retained_evidence.py 8dcac73f42dd74b8a3d2876e7b49bcfd3c4293d0
+          check_hash src/chatgpt_dev_mcp/evidence_generation_import.py 0d97623f3dffbf8953ae37f519b006a4bea8987a
+          check_hash src/chatgpt_dev_mcp/server.py 7958c7460589b70f35d7de4aee4947cc81833f13
 
           rm -rf .ci-sync
           rm .github/workflows/assemble-ci-repair.yml
