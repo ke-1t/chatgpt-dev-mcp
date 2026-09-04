@@ -1,0 +1,150 @@
+                continue
+            if any(isinstance(target, ast.Name) and target.id == name for target in targets):
+                value = node.value
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    return value.value
+        return None
+
+    if not has_definition(trees["local_maintenance"], "_bootstrap_v26_runtime", (ast.FunctionDef, ast.AsyncFunctionDef)):
+        raise RuntimeActivationError(
+            "RUNTIME_ROLLBACK_BOOTSTRAP_INCOMPATIBLE",
+            "v26 rollback source has no cold-start bootstrap entrypoint",
+        )
+    if not has_definition(trees["production_runtime"], "ProductionRuntimeHost", ast.ClassDef) or not has_definition(
+        trees["production_runtime"], "build_production_runtime", (ast.FunctionDef, ast.AsyncFunctionDef)
+    ):
+        raise RuntimeActivationError(
+            "RUNTIME_ROLLBACK_BOOTSTRAP_INCOMPATIBLE",
+            "v26 rollback source has no production maintenance host",
+        )
+    if not has_definition(trees["runtime_activation"], "validate_v26_bootstrap_contract", (ast.FunctionDef, ast.AsyncFunctionDef)):
+        raise RuntimeActivationError(
+            "RUNTIME_ROLLBACK_BOOTSTRAP_INCOMPATIBLE",
+            "v26 rollback source has no versioned bootstrap contract validator",
+        )
+    if (
+        string_constant(trees["runtime_activation"], "V26_BOOTSTRAP_CONTRACT_VERSION") != V26_BOOTSTRAP_CONTRACT_VERSION
+        or string_constant(trees["runtime_activation"], "V26_PYTHON_LOCATOR") != V26_PYTHON_LOCATOR
+    ):
+        raise RuntimeActivationError(
+            "RUNTIME_ROLLBACK_BOOTSTRAP_INCOMPATIBLE",
+            "v26 rollback source has an unknown bootstrap contract version",
+        )
+    required_binding_markers = (
+        "runtime_activation_controller",
+        "runtime_activation_current_reader",
+        "host.controller",
+        "host.read_current",
+        "host.bind_runtime",
+    )
+    if any(marker not in texts["production_runtime"] for marker in required_binding_markers):
+        raise RuntimeActivationError(
+            "RUNTIME_ROLLBACK_BOOTSTRAP_INCOMPATIBLE",
+            "v26 production factory does not expose the existing maintenance bindings",
+        )
+    has_factory_import = any(
+        (isinstance(node, ast.Name) and node.id == "build_production_runtime")
+        or (isinstance(node, ast.alias) and node.name == "build_production_runtime")
+        for node in ast.walk(trees["http_entrypoint"])
+    )
+    has_factory_call = any(
+        isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Name) and node.func.id == "build_production_runtime")
+            or (isinstance(node.func, ast.Attribute) and node.func.attr == "build_production_runtime")
+        )
+        for node in ast.walk(trees["http_entrypoint"])
+    )
+    if not has_factory_import or not has_factory_call:
+        raise RuntimeActivationError(
+            "RUNTIME_ROLLBACK_BOOTSTRAP_INCOMPATIBLE",
+            "v26 HTTP entrypoint is not bound to the production runtime factory",
+        )
+    if (
+        "bootstrap-v26-runtime" not in texts["local_maintenance"]
+        or "validate_v26_bootstrap_contract" not in texts["local_maintenance"]
+        or "_resolve_v26_python_locator" not in texts["production_runtime"]
+        or "V26_PYTHON_LOCATOR" not in texts["production_runtime"]
+        or "V26_BOOTSTRAP_CONTRACT_VERSION" not in texts["runtime_activation"]
+    ):
+        raise RuntimeActivationError(
+            "RUNTIME_ROLLBACK_BOOTSTRAP_INCOMPATIBLE",
+            "v26 rollback source does not expose the fixed bootstrap command",
+        )
+
+    head_reader = git_head_reader or _default_git_head_reader
+    clean_reader = git_clean_reader or _default_git_clean_reader
+    try:
+        head = head_reader(source)
+        clean = clean_reader(source)
+    except RuntimeActivationError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - source identity must fail closed
+        raise RuntimeActivationError(
+            "RUNTIME_ROLLBACK_BOOTSTRAP_IDENTITY_UNKNOWN",
+            "v26 rollback source Git identity could not be verified",
+        ) from exc
+    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+        raise RuntimeActivationError(
+            "RUNTIME_ROLLBACK_BOOTSTRAP_IDENTITY_UNKNOWN",
+            "v26 rollback source Git HEAD is invalid",
+        )
+    if expected_head is not None and head != expected_head:
+        raise RuntimeActivationError(
+            "RUNTIME_ROLLBACK_BOOTSTRAP_IDENTITY_MISMATCH",
+            "v26 rollback source Git HEAD differs from the pinned identity",
+        )
+    if clean is not True:
+        raise RuntimeActivationError(
+            "RUNTIME_ROLLBACK_SOURCE_DIRTY",
+            "v26 rollback source is dirty or its clean state is unknown",
+        )
+    return {
+        "status": "PASS",
+        "contract_version": V26_BOOTSTRAP_CONTRACT_VERSION,
+        "head": head,
+        "source_root": str(source),
+    }
+
+
+def _default_schema_reader(database_path: Path) -> int:
+    try:
+        connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+        try:
+            integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0]).lower()
+            if integrity != "ok":
+                raise RuntimeActivationError("CANDIDATE_DATABASE_INVALID", "candidate database integrity check failed")
+            row = connection.execute(
+                "SELECT version FROM schema_meta WHERE schema_name = 'director'"
+            ).fetchone()
+            if row is None:
+                raise RuntimeActivationError("SCHEMA_UNKNOWN", "candidate database schema is unknown")
+            return int(row[0])
+        finally:
+            connection.close()
+    except RuntimeActivationError:
+        raise
+    except (OSError, sqlite3.DatabaseError, ValueError) as exc:
+        raise RuntimeActivationError("CANDIDATE_DATABASE_INVALID", "candidate database cannot be opened read-only") from exc
+
+
+def _mapping(value: object, *, name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise RuntimeActivationError("ACTIVATION_EVIDENCE_INVALID", f"{name} must be an object")
+    return value
+
+
+class RuntimeActivationController:
+    """Validate and activate one exact v26 candidate identity."""
+
+    def __init__(
+        self,
+        *,
+        git_head_reader: Callable[[Path], str] | None = None,
+        git_clean_reader: Callable[[Path], bool] | None = None,
+        git_descendant_reader: Callable[[Path, str, str], bool] | None = None,
+        git_diff_hash_reader: Callable[[Path], str] | None = None,
+        schema_reader: Callable[[Path], int] | None = None,
+        catalog_reader: Callable[[CandidateRuntime], Mapping[str, Any]] | None = None,
+        doctor_reader: Callable[[CandidateRuntime], Mapping[str, Any]] | None = None,
+        mutation_reader: Callable[[], bool] | None = None,
