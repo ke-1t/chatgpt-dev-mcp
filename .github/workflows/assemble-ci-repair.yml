@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Assemble source modules
+      - name: Assemble source and verification fixtures
         shell: bash
         run: |
           set -euo pipefail
@@ -87,6 +87,33 @@ jobs:
           ]
           PY
 
+          cat > tests/test_policy.py <<'PY'
+          from __future__ import annotations
+
+          import unittest
+
+
+          class PolicyTests(unittest.TestCase):
+              def test_server_info_schema_and_health_are_stable_across_reads(self) -> None:
+                  from chatgpt_dev_mcp.server import WrapperRuntime
+
+                  runtime = WrapperRuntime()
+                  try:
+                      first = runtime.call_tool("server_info", {})["structuredContent"]
+                      second = runtime.call_tool("server_info", {})["structuredContent"]
+                      self.assertEqual(first["tool_schema"], second["tool_schema"])
+                      self.assertEqual(first["health"]["schema_consistency"], second["health"]["schema_consistency"])
+                      self.assertEqual(first["health"]["registry"]["config_digest"], second["health"]["registry"]["config_digest"])
+                      self.assertEqual(first["health"]["runtime"]["pid"], second["health"]["runtime"]["pid"])
+                      self.assertEqual(first["health"]["runtime"]["started_at"], second["health"]["runtime"]["started_at"])
+                  finally:
+                      runtime.close()
+
+
+          if __name__ == "__main__":
+              unittest.main()
+          PY
+
           test "$(git hash-object src/chatgpt_dev_mcp/evidence_generation_import.py)" = "0d97623f3dffbf8953ae37f519b006a4bea8987a"
           test "$(git hash-object src/chatgpt_dev_mcp/server.py)" = "7958c7460589b70f35d7de4aee4947cc81833f13"
 
@@ -104,7 +131,7 @@ jobs:
           python -m venv .venv311
           .venv311/bin/python -m pip install --upgrade pip
           .venv311/bin/python -m pip install -e .
-          .venv311/bin/python -m compileall -q src
+          .venv311/bin/python -m compileall -q src tests/test_policy.py
           .venv311/bin/python scripts/verify_fast.py
           .venv311/bin/python -m unittest discover -s tests
 
@@ -119,7 +146,7 @@ jobs:
           python -m venv .venv313
           .venv313/bin/python -m pip install --upgrade pip
           .venv313/bin/python -m pip install -e .
-          .venv313/bin/python -m compileall -q src
+          .venv313/bin/python -m compileall -q src tests/test_policy.py
           .venv313/bin/python scripts/verify_fast.py
           .venv313/bin/python -m unittest discover -s tests
 
