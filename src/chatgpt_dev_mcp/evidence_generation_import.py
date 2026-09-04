@@ -130,29 +130,40 @@ def _absolute_lexical(path: Path, *, field: str) -> Path:
     return lexical
 
 
-def _regular_database(path: Path, *, field: str) -> Path:
+def _database_error_code(role: str, suffix: str) -> str:
+    prefixes = {
+        "source": "SOURCE_DATABASE",
+        "destination": "DESTINATION_DATABASE",
+    }
+    try:
+        return f"{prefixes[role]}_{suffix}"
+    except KeyError as exc:
+        raise ValueError(f"unsupported database role: {role}") from exc
+
+
+def _regular_database(path: Path, *, field: str, role: str) -> Path:
     lexical = _absolute_lexical(path, field=field)
     try:
         info = os.lstat(lexical)
     except OSError as exc:
-        raise EvidenceGenerationImportError("SOURCE_DATABASE_UNAVAILABLE", f"{field} is unavailable") from exc
+        raise EvidenceGenerationImportError(_database_error_code(role, "UNAVAILABLE"), f"{field} is unavailable") from exc
     if not os.path.isfile(lexical) or lexical.is_symlink() or info.st_uid != os.getuid():
-        raise EvidenceGenerationImportError("SOURCE_DATABASE_UNSAFE", f"{field} is not a private regular file")
+        raise EvidenceGenerationImportError(_database_error_code(role, "UNSAFE"), f"{field} is not a private regular file")
     if info.st_mode & 0o077:
-        raise EvidenceGenerationImportError("SOURCE_DATABASE_UNSAFE", f"{field} is not private")
+        raise EvidenceGenerationImportError(_database_error_code(role, "UNSAFE"), f"{field} is not private")
     for suffix in ("-wal", "-shm"):
         sidecar = Path(f"{lexical}{suffix}")
         if sidecar.exists() or sidecar.is_symlink():
             try:
                 side_info = os.lstat(sidecar)
             except OSError as exc:
-                raise EvidenceGenerationImportError("SOURCE_DATABASE_UNSAFE", "database sidecar cannot be inspected") from exc
+                raise EvidenceGenerationImportError(_database_error_code(role, "UNSAFE"), "database sidecar cannot be inspected") from exc
             if sidecar.is_symlink() or not os.path.isfile(sidecar) or side_info.st_uid != os.getuid() or side_info.st_mode & 0o077:
-                raise EvidenceGenerationImportError("SOURCE_DATABASE_UNSAFE", "database sidecar is unsafe")
+                raise EvidenceGenerationImportError(_database_error_code(role, "UNSAFE"), "database sidecar is unsafe")
     return lexical
 
 
-def _database_asset_hash(path: Path) -> str:
+def _database_asset_hash(path: Path, *, role: str) -> str:
     """Hash the main SQLite database; WAL commits are pinned by data_version."""
 
     digest = hashlib.sha256()
@@ -161,7 +172,7 @@ def _database_asset_hash(path: Path) -> str:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
     except OSError as exc:
-        raise EvidenceGenerationImportError("SOURCE_DATABASE_UNAVAILABLE", "database hash cannot be read") from exc
+        raise EvidenceGenerationImportError(_database_error_code(role, "UNAVAILABLE"), "database hash cannot be read") from exc
     return digest.hexdigest()
 
 
@@ -175,20 +186,20 @@ def _database_identity(path: Path, *, field: str) -> tuple[int, int]:
     return int(info.st_dev), int(info.st_ino)
 
 
-def _read_only_data_version(path: Path) -> int:
+def _read_only_data_version(path: Path, *, role: str) -> int:
     try:
         connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             value = connection.execute("PRAGMA data_version").fetchone()
             if value is None:
-                raise EvidenceGenerationImportError("SOURCE_DATABASE_INVALID", "source data version is unavailable")
+                raise EvidenceGenerationImportError(_database_error_code(role, "INVALID"), "database data version is unavailable")
             return int(value[0])
         finally:
             connection.close()
     except EvidenceGenerationImportError:
         raise
     except (OSError, sqlite3.DatabaseError, ValueError) as exc:
-        raise EvidenceGenerationImportError("SOURCE_DATABASE_INVALID", "source data version is unavailable") from exc
+        raise EvidenceGenerationImportError(_database_error_code(role, "INVALID"), "database data version is unavailable") from exc
 
 
 def _read_sidecar(path: Path, *, session_id: str, workspace_id: str) -> tuple[dict[str, Any], str] | None:
@@ -259,7 +270,7 @@ class EvidenceGenerationImporter:
             raise TypeError("destination_store must be a SqliteDirectorStore")
         self.destination_store = destination_store
         self.destination_database = _absolute_lexical(destination_store.path, field="destination database")
-        _regular_database(self.destination_database, field="destination database")
+        _regular_database(self.destination_database, field="destination database", role="destination")
         self.allowed_source_roots = tuple(_absolute_lexical(Path(root), field="source root") for root in allowed_source_roots)
         self.source_sidecar_root = (
             _absolute_lexical(Path(source_sidecar_root), field="source sidecar root")
@@ -282,7 +293,7 @@ class EvidenceGenerationImporter:
         raise EvidenceGenerationImportError("SOURCE_ROOT_NOT_ALLOWED", "source database is outside the configured generation roots")
 
     def _read_bundle(self, source_database: Path, *, session_id: str, workspace_id: str, source_generation: str) -> EvidenceGenerationBundle:
-        source = _regular_database(source_database, field="source database")
+        source = _regular_database(source_database, field="source database", role="source")
         self._assert_allowed_source(source)
         if source == self.destination_database:
             raise EvidenceGenerationImportError("SOURCE_DESTINATION_SAME", "source and destination databases must be different")
@@ -295,7 +306,7 @@ class EvidenceGenerationImporter:
             connection = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA query_only=ON")
-            source_hash_before = _database_asset_hash(source)
+            source_hash_before = _database_asset_hash(source, role="source")
             source_data_version_row = connection.execute("PRAGMA data_version").fetchone()
             if source_data_version_row is None:
                 raise EvidenceGenerationImportError("SOURCE_DATABASE_INVALID", "source data version is unavailable")
@@ -375,7 +386,7 @@ class EvidenceGenerationImporter:
                 connection.close()
             except (NameError, AttributeError):
                 pass
-        if source_hash_before is None or source_data_version is None or _database_asset_hash(source) != source_hash_before:
+        if source_hash_before is None or source_data_version is None or _database_asset_hash(source, role="source") != source_hash_before:
             raise EvidenceGenerationImportError("SOURCE_DATABASE_CHANGED", "source database changed during preflight")
         current_device, current_inode = _database_identity(source, field="source database")
         if (current_device, current_inode) != (source_device, source_inode):
@@ -439,20 +450,33 @@ class EvidenceGenerationImporter:
         workspace_id: str,
         source_generation: str = "v25",
     ) -> EvidenceImportPlan:
-        if not isinstance(source_generation, str) or not source_generation or not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", source_generation):
+        if (
+            not isinstance(source_generation, str)
+            or "\x00" in source_generation
+            or not source_generation
+            or not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", source_generation)
+        ):
             raise EvidenceGenerationImportError("SOURCE_GENERATION_INVALID", "source generation is required")
-        if not session_id or not isinstance(session_id, str) or "/" in session_id or "\\" in session_id:
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or "\x00" in session_id
+            or "/" in session_id
+            or "\\" in session_id
+        ):
             raise EvidenceGenerationImportError("SESSION_ID_INVALID", "session id is invalid")
-        if not workspace_id or not isinstance(workspace_id, str):
+        if not isinstance(workspace_id, str) or not workspace_id or "\x00" in workspace_id:
             raise EvidenceGenerationImportError("WORKSPACE_IDENTITY_INVALID", "workspace id is required")
+        if not isinstance(source_database, (str, Path)) or "\x00" in str(source_database):
+            raise EvidenceGenerationImportError("SOURCE_DATABASE_INVALID", "source database path is invalid")
         if self.destination_store.schema_version != CURRENT_SCHEMA_VERSION:
             raise EvidenceGenerationImportError("DESTINATION_SCHEMA_INVALID", "destination schema is not schema 14")
         try:
             self.destination_store.integrity_check()
         except PersistenceError as exc:
             raise EvidenceGenerationImportError("DESTINATION_DATABASE_INVALID", "destination database integrity failed") from exc
-        destination_hash = _database_asset_hash(self.destination_database)
-        destination_data_version = _read_only_data_version(self.destination_database)
+        destination_hash = _database_asset_hash(self.destination_database, role="destination")
+        destination_data_version = _read_only_data_version(self.destination_database, role="destination")
         destination_device, destination_inode = _database_identity(self.destination_database, field="destination database")
         bundle = self._read_bundle(Path(source_database), session_id=session_id, workspace_id=workspace_id, source_generation=source_generation)
         import_id = "evidence-import:" + hashlib.sha256(
@@ -478,7 +502,7 @@ class EvidenceGenerationImporter:
         )
 
     def execute(self, plan: EvidenceImportPlan) -> dict[str, Any]:
-        source = _regular_database(plan.bundle.source_database, field="source database")
+        source = _regular_database(plan.bundle.source_database, field="source database", role="source")
         self._assert_allowed_source(source)
         if source == self.destination_database:
             raise EvidenceGenerationImportError("SOURCE_DESTINATION_SAME", "source and destination databases must be different")
@@ -504,11 +528,14 @@ class EvidenceGenerationImporter:
             current_sidecar_hash = current_sidecar[1] if current_sidecar is not None else ""
             if current_sidecar_hash != expected_sidecar_hash:
                 raise EvidenceGenerationImportError("SOURCE_SIDECAR_CHANGED", "source sidecar changed after preflight")
-        if _database_asset_hash(source) != plan.bundle.source_database_sha256 or _read_only_data_version(source) != plan.bundle.source_data_version:
+        if (
+            _database_asset_hash(source, role="source") != plan.bundle.source_database_sha256
+            or _read_only_data_version(source, role="source") != plan.bundle.source_data_version
+        ):
             raise EvidenceGenerationImportError("SOURCE_DATABASE_CHANGED", "source database changed after preflight")
         if (
-            _database_asset_hash(self.destination_database) != plan.destination_database_sha256
-            or _read_only_data_version(self.destination_database) != plan.destination_data_version
+            _database_asset_hash(self.destination_database, role="destination") != plan.destination_database_sha256
+            or _read_only_data_version(self.destination_database, role="destination") != plan.destination_data_version
         ):
             raise EvidenceGenerationImportError("DESTINATION_DATABASE_CHANGED", "destination database changed after preflight")
         destination_state = {
