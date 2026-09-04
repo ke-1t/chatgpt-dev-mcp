@@ -2714,6 +2714,9 @@ class WrapperRuntime:
         *,
         clock: Callable[[], float] | None = None,
         preserve_persistent_state: bool = False,
+        operator_mode: bool = False,
+        persistence: SqliteDirectorStore | None = None,
+        config_path: Path | None = None,
         managed_cloud_adapter: ChatGPTManagedCloudAdapter | None = None,
         runtime_activation_controller: RuntimeActivationController | None = None,
         runtime_activation_current_reader: Callable[[], RuntimeReadback | Mapping[str, Any]] | None = None,
@@ -2724,6 +2727,11 @@ class WrapperRuntime:
         # explicit recovery/test embedders; production STDIO constructs one
         # normal wrapper per child and rotates only protocol state.
         self._preserve_persistent_state = bool(preserve_persistent_state)
+        # An external operator may reuse the domain handlers without entering
+        # the MCP transport.  Its initialization must remain observational:
+        # startup reconciliation belongs to the normal runtime lifecycle and
+        # is never an incidental side effect of an operator read/preflight.
+        self._operator_mode = bool(operator_mode)
         # The MCP protocol bit belongs to the current protocol session.  The
         # compat transport may reset it when a long-lived Tunnel child sees a
         # new connector session; workspace/development state remains owned by
@@ -2754,7 +2762,7 @@ class WrapperRuntime:
         self._approved_session_bindings: dict[str, tuple[str, str]] = {}
         self._task_process_sessions: dict[str, TaskProcessBinding] = {}
         self.approved_output_refs: set[str] = set()
-        self.config_path = _config_path()
+        self.config_path = Path(config_path).expanduser() if config_path is not None else _config_path()
         self._project_policy = ProjectPolicyManager(
             self.config_path,
             normalize_policy=self._normalize_project_policy,
@@ -3078,20 +3086,26 @@ class WrapperRuntime:
         # database-wide persistence error so other workspaces can continue to
         # use task/lease persistence.
         self._director_workspace_quarantine: dict[str, dict[str, str]] = {}
-        try:
-            self._persistence: SqliteDirectorStore | None = SqliteDirectorStore(
-                _director_db_path_for_runtime(self.config_path)
-            )
-        except PersistenceError as exc:
-            # Diagnostics remain available, but all Director mutations fail
-            # closed until the operator repairs the state database.
-            self._persistence = None
-            self._persistence_error = str(exc)
-        if self._persistence is not None:
+        if persistence is not None and not isinstance(persistence, SqliteDirectorStore):
+            raise TypeError("persistence must be a SqliteDirectorStore")
+        if persistence is not None:
+            self._persistence = persistence
+        else:
             try:
-                self._persistence.purge_task_process_bindings(now=self._now())
+                self._persistence = SqliteDirectorStore(
+                    _director_db_path_for_runtime(self.config_path)
+                )
             except PersistenceError as exc:
+                # Diagnostics remain available, but all Director mutations fail
+                # closed until the operator repairs the state database.
+                self._persistence = None
                 self._persistence_error = str(exc)
+        if self._persistence is not None:
+            if not self._operator_mode:
+                try:
+                    self._persistence.purge_task_process_bindings(now=self._now())
+                except PersistenceError as exc:
+                    self._persistence_error = str(exc)
         self._warm_runtimes = WarmRuntimeManager(max_entries=16, ttl_seconds=300.0)
         self._verification_cache = VerificationCache(store=self._persistence)
         self._acceleration_observer = AccelerationObserver(store=self._persistence)
@@ -3170,12 +3184,13 @@ class WrapperRuntime:
         self._system_inspection = SystemInspectionController()
         self._platform_bundles: dict[tuple[str, str], PlatformBundle] = {}
         self._restore_persisted_state()
-        self._restore_session_sidecars(preserve_active=self._preserve_persistent_state)
-        if self._preserve_persistent_state:
+        if not self._operator_mode:
+            self._restore_session_sidecars(preserve_active=self._preserve_persistent_state)
+        if self._preserve_persistent_state and not self._operator_mode:
             self._reconcile_preserved_active_sessions()
             self._reconcile_preserved_stale_sessions()
         self._startup_reconciliation_error: str | None = None
-        if not self._preserve_persistent_state:
+        if not self._preserve_persistent_state and not self._operator_mode:
             try:
                 self._recover_restart_checkpointed_sessions()
             except Exception as exc:  # noqa: BLE001 - recovery must fail closed per session
@@ -4955,7 +4970,8 @@ class WrapperRuntime:
         if self._persistence is None:
             return
         try:
-            self._persistence.reconcile_terminal_git_outcomes()
+            if not self._operator_mode:
+                self._persistence.reconcile_terminal_git_outcomes()
             git_closeouts = {
                 str(item.get("receipt_id", "")): item
                 for item in self._persistence.load_git_closeouts()
@@ -5037,7 +5053,8 @@ class WrapperRuntime:
                 )
                 self._director_audit_receipt_history[receipt.receipt_id] = receipt
                 self._director_audit_receipts[receipt.workspace_id] = receipt
-            self._restore_verified_canonical_review_ready_tasks(task_records, workspace_entries)
+            if not self._operator_mode:
+                self._restore_verified_canonical_review_ready_tasks(task_records, workspace_entries)
             for item in self._persistence.load_project_policy_receipts():
                 receipt = dict(item)
                 self._project_policy_receipts[str(receipt["receipt_id"])] = receipt
@@ -13747,6 +13764,16 @@ class WrapperRuntime:
                 base_revision=str(value.get("base_revision") or ""),
                 patch_hash=str(value.get("patch_hash") or ""),
                 source_clean=value.get("source_clean") if isinstance(value.get("source_clean"), bool) else None,
+                healthz=str(value.get("healthz") or ""),
+                readyz=str(value.get("readyz") or ""),
+                module_path=Path(str(value["module_path"])) if value.get("module_path") is not None else None,
+                working_directory=Path(str(value["working_directory"])) if value.get("working_directory") is not None else None,
+                restart_required=value.get("restart_required") if isinstance(value.get("restart_required"), bool) else None,
+                outcome_unknown_count=(
+                    int(value["outcome_unknown_count"])
+                    if value.get("outcome_unknown_count") is not None
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise StableCapabilityGatewayError(

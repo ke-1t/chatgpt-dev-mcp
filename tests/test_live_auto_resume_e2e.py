@@ -11,9 +11,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 EXECUTABLE = ROOT / ".venv" / "bin" / "chatgpt-dev-mcp"
+RUN_LIVE_TESTS = os.environ.get("DEVMCP_RUN_LIVE_TESTS") == "1"
 
 
-@unittest.skipUnless(EXECUTABLE.is_file(), "the repository live MCP executable is not installed")
+@unittest.skipUnless(
+    RUN_LIVE_TESTS and EXECUTABLE.is_file(),
+    "set DEVMCP_RUN_LIVE_TESTS=1 and install the live MCP executable",
+)
 class LiveAutoResumeE2ETests(unittest.TestCase):
     """Exercise safe auto-resume through separate live MCP processes."""
 

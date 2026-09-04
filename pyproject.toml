@@ -27,6 +27,7 @@ classifiers = [
 
 [project.scripts]
 chatgpt-dev-mcp = "chatgpt_dev_mcp.server:main"
+# private-canonical operator is omitted from public publication
 
 [project.urls]
 Homepage = "https://github.com/ke-1t/chatgpt-dev-mcp"

@@ -167,6 +167,13 @@ That check opens the existing schema-14 Director database read-only and fails
 closed on an incompatible or unsafe state. It never copies, downgrades,
 deletes, or edits a database, and it does not import v25 evidence.
 
+### Native external operator
+
+The `local-dev-mcp-operator` entrypoint is a private-canonical maintenance
+surface. It is intentionally omitted from the public publication artifact;
+public installations must use the ordinary MCP surface. The private native
+operator documentation is maintained outside the public publication tree.
+
 `development.evidence.import_generation` is the bounded bridge for retained
 state from another recognized generation. Preflight pins the private source
 database inode/hash/data-version, schema, selected session, task dependency
