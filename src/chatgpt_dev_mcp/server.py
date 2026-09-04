@@ -4819,7 +4819,8 @@ class WrapperRuntime:
             return False
         try:
             root = entry.path.resolve(strict=True)
-            expected_tree_id = f"worktree:{sha256_text(f'canonical\0{entry.identifier}\0{root}')[:32]}"
+            tree_identity = f"canonical\0{entry.identifier}\0{root}"
+            expected_tree_id = f"worktree:{sha256_text(tree_identity)[:32]}"
             if working_tree_id != expected_tree_id:
                 return False
             if WrapperRuntime._director_git_head(root) != actual_head:
