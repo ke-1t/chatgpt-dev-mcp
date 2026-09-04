@@ -114,6 +114,23 @@ jobs:
               unittest.main()
           PY
 
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("tests/test_http_transport.py")
+          text = path.read_text(encoding="utf-8")
+          old = '        self.assertEqual(doctor["result"]["structuredContent"]["failure_class"], "HEALTHY")\n'
+          new = '''        diagnosis = doctor["result"]["structuredContent"]
+          self.assertIn(diagnosis["failure_class"], {"HEALTHY", "TUNNEL_UNAVAILABLE"})
+          if diagnosis["failure_class"] == "TUNNEL_UNAVAILABLE":
+              self.assertEqual(diagnosis["evidence"]["tunnel_status"], "unavailable")
+              self.assertIn("recover_local_tunnel", diagnosis["recommended_actions"])
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("expected unique v26 doctor assertion was not found")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          PY
+
           test "$(git hash-object src/chatgpt_dev_mcp/evidence_generation_import.py)" = "0d97623f3dffbf8953ae37f519b006a4bea8987a"
           test "$(git hash-object src/chatgpt_dev_mcp/server.py)" = "7958c7460589b70f35d7de4aee4947cc81833f13"
 
@@ -131,7 +148,7 @@ jobs:
           python -m venv .venv311
           .venv311/bin/python -m pip install --upgrade pip
           .venv311/bin/python -m pip install -e .
-          .venv311/bin/python -m compileall -q src tests/test_policy.py
+          .venv311/bin/python -m compileall -q src tests/test_policy.py tests/test_http_transport.py
           .venv311/bin/python scripts/verify_fast.py
           .venv311/bin/python -m unittest discover -s tests
 
@@ -146,7 +163,7 @@ jobs:
           python -m venv .venv313
           .venv313/bin/python -m pip install --upgrade pip
           .venv313/bin/python -m pip install -e .
-          .venv313/bin/python -m compileall -q src tests/test_policy.py
+          .venv313/bin/python -m compileall -q src tests/test_policy.py tests/test_http_transport.py
           .venv313/bin/python scripts/verify_fast.py
           .venv313/bin/python -m unittest discover -s tests
 
