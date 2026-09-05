@@ -12,13 +12,19 @@ import tempfile
 import threading
 import time
 import weakref
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from coding_tools_mcp.errors import JsonRpcError, ToolFailure
+from coding_tools_mcp.protocol import (
+    LATEST_LEGACY_PROTOCOL_VERSION,
+    MODERN_PROTOCOL_VERSIONS,
+    RequestContext,
+)
 from coding_tools_mcp.server import (
     PERMISSION_MODE_CAPABILITIES,
     TOOL_REGISTRY,
@@ -28,10 +34,11 @@ from coding_tools_mcp.server import (
     tool_output_schema,
 )
 from coding_tools_mcp.tool_results import make_tool_result
+from coding_tools_mcp.telemetry import SessionTelemetry
 
 from . import __version__
 from .acceleration_runtime import AccelerationRuntimeServices, workspace_state_evidence
-from .chatgpt_connector_compat import serve_stdio_compat
+from .chatgpt_connector_compat import current_request_id, serve_stdio_compat
 from .discovery import (
     AllowedRoot,
     DiscoveryCandidate,
@@ -287,6 +294,7 @@ from .platform_runtime import (
 from .stable_surface import (
     PROFILE_STABLE_GATEWAY,
     STABLE_SURFACE_REVISION,
+    STABLE_PUBLIC_TOOL_NAMES,
     select_stable_surface,
     surface_mode_from_environment,
 )
@@ -412,7 +420,7 @@ _PROCESS_CAPABILITY_PREFLIGHT_STORE = CapabilityPreflightStore()
 PROFILE_NAMES = ("READ_ONLY", "READ_WRITE", "DEVELOPMENT")
 TASK_NAMES = ("test", "lint", "build", "dev", "format")
 HIDDEN_UPSTREAM_TOOLS = frozenset(
-    {"apply_patch", "exec_command", "write_stdin", "kill_session", "read_output"}
+    {"apply_patch", "exec_command", "write_stdin", "kill_command", "read_output"}
 )
 WRITE_TOOLS = frozenset({"apply_patch"})
 GLOBAL_DIAGNOSTIC_TOOLS = frozenset(
@@ -467,7 +475,6 @@ EVIDENCE_ONLY_OBSERVER_TOOLS = frozenset(
 WORKSPACE_BOUND_UPSTREAM_TOOLS = frozenset(
     {
         "check_exec_environment",
-        "get_default_cwd",
         "read_file",
         "list_dir",
         "list_files",
@@ -479,7 +486,6 @@ WORKSPACE_BOUND_UPSTREAM_TOOLS = frozenset(
         "git_blame",
         "request_permissions",
         "view_image",
-        "set_default_cwd",
     }
 )
 WORKSPACE_BOUND_CUSTOM_TOOLS = frozenset(
@@ -1318,6 +1324,29 @@ STABLE_GATEWAY_TOOLS = [
     ),
 ]
 STABLE_GATEWAY_TOOL_NAMES = frozenset(str(item["name"]) for item in STABLE_GATEWAY_TOOLS)
+HIDDEN_REGISTRY_MUTATION_TOOLS = frozenset(
+    {
+        "workspace_register_preflight",
+        "workspace_register",
+        "workspace_unregister_preflight",
+        "workspace_unregister",
+        "workspace_registration_update_preflight",
+        "workspace_registration_update",
+        "workspace_platform_profile_register_preflight",
+        "workspace_platform_profile_register",
+        "workspace_project_policy_update",
+        "workspace_promote_development",
+        "workspace_project_create",
+    }
+)
+_AUTHORIZED_CAPABILITY_RUNTIME: ContextVar[object | None] = ContextVar(
+    "devmcp_authorized_capability_runtime",
+    default=None,
+)
+_AUTHORIZED_PUBLIC_TOOL_NAMES: ContextVar[frozenset[str] | None] = ContextVar(
+    "devmcp_authorized_public_tool_names",
+    default=None,
+)
 VERIFICATION_SHARD_POLL_BUDGET_SECONDS = 90.0
 FULL_VERIFICATION_COMMAND_TIMEOUT_MS = 600_000
 FULL_VERIFICATION_SHARD_POLL_BUDGET_SECONDS = 100.0
@@ -2712,6 +2741,7 @@ class WrapperRuntime:
     def __init__(
         self,
         *,
+        transport: str = "stdio",
         clock: Callable[[], float] | None = None,
         preserve_persistent_state: bool = False,
         operator_mode: bool = False,
@@ -2732,11 +2762,18 @@ class WrapperRuntime:
         # startup reconciliation belongs to the normal runtime lifecycle and
         # is never an incidental side effect of an operator read/preflight.
         self._operator_mode = bool(operator_mode)
+        # coding-tools-mcp 0.3 requires a real per-runtime telemetry object.
+        # It is disabled by the process entrypoint by default, but keeping the
+        # object present means the same runtime contract is exercised by
+        # production, HTTP, STDIO, and test embedders.
+        self.transport = transport
+        self.telemetry = SessionTelemetry(permission_mode="safe", transport=transport)
         # The MCP protocol bit belongs to the current protocol session.  The
         # compat transport may reset it when a long-lived Tunnel child sees a
         # new connector session; workspace/development state remains owned by
         # this wrapper runtime.
         self.initialized = False
+        self.protocol_version = LATEST_LEGACY_PROTOCOL_VERSION
         self.protocol_state = "NEW"
         self.transport_generation = 1
         self.protocol_session_generation = 0
@@ -3415,7 +3452,7 @@ class WrapperRuntime:
         # make the restart fence a second, broader active-session sync gate.
         if name in EVIDENCE_ONLY_OBSERVER_TOOLS:
             return False
-        if name in {"local_maintenance", "set_default_cwd", "request_permissions"}:
+        if name in {"local_maintenance", "request_permissions"}:
             return True
         classified = self._request_side_effect_class(name, args)
         if classified is not SideEffectClass.READ_ONLY:
@@ -3434,9 +3471,12 @@ class WrapperRuntime:
     @staticmethod
     def _request_operation_key(name: str, args: dict[str, Any]) -> str | None:
         if name in {"task_poll", "task_stop"}:
-            process_session_id = args.get("process_session_id") or args.get("session_id")
-            if isinstance(process_session_id, str) and process_session_id:
-                return f"process:{process_session_id}"
+            # v0.3's command_id is canonical.  The process_session_id and
+            # session_id spellings remain response/input aliases for older
+            # DevMCP clients, but must never become a second authority.
+            command_id = args.get("command_id") or args.get("process_session_id") or args.get("session_id")
+            if isinstance(command_id, str) and command_id:
+                return f"command:{command_id}"
         return None
 
     def _process_session_alive(self, process_session_id: str) -> bool:
@@ -3664,11 +3704,11 @@ class WrapperRuntime:
             else:
                 # Attach a process receipt before terminalizing run_task.
                 if record.tool_name == "run_task" and isinstance(structured, dict):
-                    process_session_id = structured.get("session_id")
-                    if isinstance(process_session_id, str) and process_session_id:
+                    command_id = structured.get("command_id")
+                    if isinstance(command_id, str) and command_id:
                         self.request_registry.attach_process(
                             request_id,
-                            process_session_id,
+                            command_id,
                             generation=record.key.transport_generation,
                         )
                 self.request_registry.complete(request_id, generation=record.key.transport_generation)
@@ -3816,14 +3856,18 @@ class WrapperRuntime:
 
     @staticmethod
     def _runtime_process_session(runtime: object, process_session_id: str) -> object | None:
-        sessions = getattr(runtime, "sessions", None)
-        output_sessions = getattr(runtime, "output_sessions", None)
-        session = sessions.get(process_session_id) if isinstance(sessions, dict) else None
-        if session is None and isinstance(output_sessions, dict):
-            session = output_sessions.get(process_session_id)
-        if session is None:
+        # coding-tools-mcp 0.3 names the workspace-owned process registry
+        # ``commands``/``output_commands``. Keep this adapter method name only
+        # for the outer DevMCP compatibility contract; the value is a command
+        # id, never an upstream transport-session id.
+        commands = getattr(runtime, "commands", None)
+        output_commands = getattr(runtime, "output_commands", None)
+        command = commands.get(process_session_id) if isinstance(commands, dict) else None
+        if command is None and isinstance(output_commands, dict):
+            command = output_commands.get(process_session_id)
+        if command is None:
             return None
-        process = getattr(session, "process", None)
+        process = getattr(command, "process", None)
         poll = getattr(process, "poll", None)
         if not callable(poll):
             return None
@@ -3831,7 +3875,7 @@ class WrapperRuntime:
             poll()
         except (OSError, AttributeError, TypeError, ValueError):
             return None
-        return session
+        return command
 
     def _runtime_for_process_binding(
         self,
@@ -4118,7 +4162,7 @@ class WrapperRuntime:
             write_session_sidecar(session)
             sidecar_written = True
             self._persist_development_session(session)
-            runtime = Runtime(target, permission_mode="safe", transport="stdio")
+            runtime = Runtime(target, permission_mode="safe", transport=self.transport)
             self.development_sessions[session_id] = session
             self._development_runtimes[session_id] = runtime
             scope_snapshot = self._director_scope_snapshot(
@@ -5289,7 +5333,7 @@ class WrapperRuntime:
                     base_revision=lease.base_revision,
                     detail="RESTART_CHECKPOINT_RECOVERED",
                 )
-                recovered_runtime = Runtime(session.worktree_path, permission_mode="safe", transport="stdio")
+                recovered_runtime = Runtime(session.worktree_path, permission_mode="safe", transport=self.transport)
                 session.identity = identity
                 session.allowed_tasks = dict(entry.commands)
                 session.stale = False
@@ -6257,11 +6301,21 @@ class WrapperRuntime:
                 self._director_audit_receipt_history[receipt_id] = stale
                 self._director_audit_receipts[stale.workspace_id] = stale
 
-    def initialize(self, client_info: dict[str, Any] | None = None) -> dict[str, Any]:
+    def initialize(
+        self,
+        client_info: dict[str, Any] | None = None,
+        protocol_version: str = LATEST_LEGACY_PROTOCOL_VERSION,
+    ) -> dict[str, Any]:
+        self.protocol_version = protocol_version
+        self.initialized = True
+        self.telemetry.record_session_start(client_info, protocol_version)
+        return self.initialize_result(protocol_version)
+
+    def initialize_result(self, protocol_version: str = LATEST_LEGACY_PROTOCOL_VERSION) -> dict[str, Any]:
         return {
-            "protocolVersion": self.protocol_version,
+            "protocolVersion": protocol_version,
             "capabilities": {"tools": {"listChanged": True}},
-            "serverInfo": {"name": "chatgpt-dev-mcp", "title": "ChatGPT Dev MCP", "version": __version__},
+            "serverInfo": self.server_identity(),
             "instructions": (
                 "Select a registered workspace with workspace_list then workspace_open. "
                 "READ_ONLY is the default; DEVELOPMENT permits guarded edits in the registered workspace "
@@ -6271,6 +6325,18 @@ class WrapperRuntime:
                 "No tool accepts arbitrary absolute paths, direct shell commands, or sensitive credential paths."
             ),
         }
+
+    def discover_payload(self) -> dict[str, Any]:
+        """Return the coding-tools-mcp 0.3 modern discovery payload."""
+
+        return {
+            "supportedVersions": list(MODERN_PROTOCOL_VERSIONS),
+            "capabilities": {"tools": {"listChanged": True}},
+            "instructions": self.initialize_result()["instructions"],
+        }
+
+    def server_identity(self) -> dict[str, Any]:
+        return {"name": "chatgpt-dev-mcp", "title": "ChatGPT Dev MCP", "version": __version__}
 
     def reset_protocol_session(self) -> None:
         """Reset only MCP handshake state for a new logical connection.
@@ -6283,8 +6349,10 @@ class WrapperRuntime:
         self.initialized = False
 
     def cancel_request(self, request_id: str | int) -> None:
-        if self.upstream is not None:
-            self.upstream.cancel_request(request_id)
+        # coding-tools-mcp 0.3 separates request cancellation from
+        # workspace-owned command termination. Never turn a transport
+        # notification into a command kill; task_stop maps to kill_command.
+        return None
 
     def connection_replacement_block_reason(self) -> str | None:
         """Fail closed before an operation that would destroy this runtime."""
@@ -6424,6 +6492,7 @@ class WrapperRuntime:
         self._development_runtimes.clear()
         self.upstream = None
         self._workspace_bindings.clear()
+        self.telemetry.finish()
 
     def _upstream_tool_definitions(self) -> list[dict[str, Any]]:
         if self.upstream is not None:
@@ -6569,6 +6638,34 @@ class WrapperRuntime:
             raise RuntimeError("v26 READ_ONLY continuity cannot switch after a v25 root was opened")
         self._readonly_paths = ReadOnlyPathManager(clock=self._clock, persistence=self._persistence)
         self._durable_readonly_roots = True
+
+    def current_readonly_workspace_id(self) -> str:
+        """Return the server-selected workspace identity for READ_ONLY binding."""
+
+        current = self.current
+        if current is None:
+            return ""
+        return self._director_logical_workspace_id(current)
+
+    @contextmanager
+    def _public_surface_scope(self, tool_names: frozenset[str]):
+        """Temporarily authorize the exact versioned client surface."""
+
+        token = _AUTHORIZED_PUBLIC_TOOL_NAMES.set(tool_names)
+        try:
+            yield
+        finally:
+            _AUTHORIZED_PUBLIC_TOOL_NAMES.reset(token)
+
+    def bind_readonly_identity(self, owner_id: object, session_id: object) -> None:
+        """Bind HTTP READ_ONLY handles to the server-owned session identity."""
+
+        self._readonly_paths.bind_identity(
+            owner_id,
+            session_id,
+            workspace_id_provider=self.current_readonly_workspace_id,
+            require_binding=True,
+        )
 
     def list_tools(self) -> dict[str, Any]:
         definitions = self._visible_tool_definitions()
@@ -7017,7 +7114,7 @@ class WrapperRuntime:
             raise ToolFailure(exc.code, exc.message, category="security") from None
         runtime = self._development_runtimes.get(session.session_id)
         if runtime is None and preserved_claim:
-            runtime = Runtime(session.worktree_path, permission_mode="safe", transport="stdio")
+            runtime = Runtime(session.worktree_path, permission_mode="safe", transport=self.transport)
             self._development_runtimes[session.session_id] = runtime
             try:
                 self._persist_development_session(session)
@@ -7164,7 +7261,7 @@ class WrapperRuntime:
         binding_key = (lease.workspace_id, lease.working_tree_id)
         created_runtime: Runtime | None = None
         if binding_key not in self._workspace_bindings:
-            created_runtime = Runtime(entry.path, permission_mode="safe", transport="stdio")
+            created_runtime = Runtime(entry.path, permission_mode="safe", transport=self.transport)
             self._workspace_bindings[binding_key] = (entry, created_runtime)
         try:
             restored = self._director_writer_manager.restore([lease], now=self._now())
@@ -7384,7 +7481,7 @@ class WrapperRuntime:
                     expected_tree_id = self._director_working_tree_id(registered_entry)
                     if working_tree_id is None or working_tree_id == expected_tree_id:
                         try:
-                            rebound_runtime = Runtime(registered_entry.path, permission_mode="safe", transport="stdio")
+                            rebound_runtime = Runtime(registered_entry.path, permission_mode="safe", transport=self.transport)
                         except ToolFailure:
                             raise
                         except Exception as exc:
@@ -7500,7 +7597,15 @@ class WrapperRuntime:
                 return root
         raise ToolFailure("ROOT_NOT_FOUND", "The requested root is not configured.", category="not_found", details={"root_id": root_id})
 
-    def _route_upstream(self, name: str, args: dict[str, Any], *, request_id: str | int | None = None, internal: bool = False) -> dict[str, Any]:
+    def _route_upstream(
+        self,
+        name: str,
+        args: dict[str, Any],
+        *,
+        request_id: str | int | None = None,
+        context: RequestContext | None = None,
+        internal: bool = False,
+    ) -> dict[str, Any]:
         explicit_binding = any(
             isinstance(args.get(key), str) and args.get(key)
             for key in ("session_id", "lease_id", "workspace_ref", "workspace_id", "working_tree_id")
@@ -7532,13 +7637,11 @@ class WrapperRuntime:
         self._check_path_args(name, call_args)
         if name in WRITE_TOOLS:
             self._require_profile("READ_WRITE|DEVELOPMENT", entry=entry)
-        if name == "set_default_cwd":
-            self._require_profile("READ_ONLY|READ_WRITE|DEVELOPMENT", entry=entry)
-        allowed_names = {"server_info", "check_exec_environment", "get_default_cwd", "read_file", "list_dir", "list_files", "search_text", "git_status", "git_diff", "git_log", "git_show", "git_blame", "request_permissions", "view_image", "set_default_cwd"}
+        allowed_names = {"server_info", "check_exec_environment", "read_file", "list_dir", "list_files", "search_text", "git_status", "git_diff", "git_log", "git_show", "git_blame", "request_permissions", "view_image"}
         if internal:
             allowed_names.add("apply_patch")
         if name in allowed_names:
-            result = runtime.call_tool(name, call_args, request_id=request_id)
+            result = runtime.call_tool(name, call_args, context=context)
             structured = result.get("structuredContent")
             if isinstance(structured, dict):
                 safe = _sanitize_payload(structured)
@@ -10216,7 +10319,7 @@ class WrapperRuntime:
             write_session_sidecar(session)
             sidecar_written = True
             self._persist_development_session(session)
-            new_runtime = Runtime(target, permission_mode="safe", transport="stdio")
+            new_runtime = Runtime(target, permission_mode="safe", transport=self.transport)
         except Exception as exc:
             if sidecar_written and target is not None:
                 try:
@@ -10583,7 +10686,7 @@ class WrapperRuntime:
                 restored_at=restored.restored_at,
             )
 
-            new_runtime = Runtime(target, permission_mode="safe", transport="stdio")
+            new_runtime = Runtime(target, permission_mode="safe", transport=self.transport)
             new_session.stale = False
             new_session.lifecycle_state = "active"
             write_session_sidecar(new_session)
@@ -11256,7 +11359,7 @@ class WrapperRuntime:
                 session.source_snapshot_id,
                 session.source_snapshot_hash,
             )
-            new_runtime = Runtime(session.worktree_path, permission_mode="safe", transport="stdio")
+            new_runtime = Runtime(session.worktree_path, permission_mode="safe", transport=self.transport)
             write_session_sidecar(new_session)
             sidecar_written = True
             self._persist_development_session(new_session)
@@ -11595,7 +11698,7 @@ class WrapperRuntime:
         runtime_created = False
         try:
             if runtime is None:
-                runtime = Runtime(session.worktree_path, permission_mode="safe", transport="stdio")
+                runtime = Runtime(session.worktree_path, permission_mode="safe", transport=self.transport)
                 runtime_created = True
             task = self._director_ledger.reactivate(
                 task.task_id,
@@ -15480,7 +15583,7 @@ class WrapperRuntime:
                 raise ToolFailure(exc.code, exc.message, category="security") from None
             runtime = self._development_runtimes.get(session.session_id)
             if runtime is None:
-                runtime = Runtime(session.worktree_path, permission_mode="safe", transport="stdio")
+                runtime = Runtime(session.worktree_path, permission_mode="safe", transport=self.transport)
                 self._development_runtimes[session.session_id] = runtime
             self.current = WorkspaceEntry(session.session_id, session.worktree_path, "DEVELOPMENT", dict(session.allowed_tasks), dict(entry.metadata), entry.platform)
             self.upstream = runtime
@@ -15556,7 +15659,7 @@ class WrapperRuntime:
             new_runtime = existing_binding[1]
         else:
             try:
-                new_runtime = Runtime(entry.path, permission_mode="safe", transport="stdio")
+                new_runtime = Runtime(entry.path, permission_mode="safe", transport=self.transport)
             except ToolFailure:
                 raise
             except Exception as exc:
@@ -15613,7 +15716,7 @@ class WrapperRuntime:
             entry, runtime = self.current, self.upstream
         else:
             entry, runtime = self._require_workspace_args(args, require_live=False)
-        status_result = runtime.call_tool("git_status", {"path": ".", "max_entries": 200}, request_id=None)
+        status_result = runtime.call_tool("git_status", {"path": ".", "max_entries": 200})
         status = status_result.get("structuredContent", {})
         payload: dict[str, Any] = {
             "workspace_id": entry.identifier,
@@ -16361,7 +16464,6 @@ class WrapperRuntime:
             result = runtime.call_tool(
                 "git_status",
                 {"path": ".", "include_untracked": True, "max_entries": 1000},
-                request_id=None,
             )
             payload = result.get("structuredContent")
             if result.get("isError") or not isinstance(payload, Mapping):
@@ -16420,7 +16522,7 @@ class WrapperRuntime:
 
         def safe_reader(path: str) -> str:
             self._check_path_args("read_file", {"path": path})
-            result = runtime.call_tool("read_file", {"path": path, "max_bytes": 65536}, request_id=None)
+            result = runtime.call_tool("read_file", {"path": path, "max_bytes": 65536})
             payload = result.get("structuredContent")
             if result.get("isError") or not isinstance(payload, Mapping) or not isinstance(payload.get("content"), str):
                 raise ValueError("workspace file could not be read safely")
@@ -16430,7 +16532,6 @@ class WrapperRuntime:
             result = runtime.call_tool(
                 "git_diff",
                 {"paths": [path], "staged": False, "unstaged": True, "context_lines": 3, "max_bytes": 16384},
-                request_id=None,
             )
             payload = result.get("structuredContent")
             if result.get("isError") or not isinstance(payload, Mapping):
@@ -16525,7 +16626,6 @@ class WrapperRuntime:
                 diff_result = runtime.call_tool(
                     "git_diff",
                     {"paths": list(changed_paths), "staged": False, "unstaged": True, "context_lines": 3, "max_bytes": 262144},
-                    request_id=None,
                 )
                 diff_payload = diff_result.get("structuredContent")
                 if not diff_result.get("isError") and isinstance(diff_payload, Mapping) and isinstance(diff_payload.get("diff", ""), str):
@@ -16616,17 +16716,17 @@ class WrapperRuntime:
             payload = run_result.get("structuredContent")
             if not isinstance(payload, Mapping):
                 return {"exit_code": None, "output": "verification task returned no structured result", "duration_ms": (time.monotonic() - started) * 1000, "timed_out": False}
-            process_id = payload.get("session_id")
+            command_id = payload.get("command_id")
             # Leave an explicit margin below the outer MCP call timeout. Full
             # verification is continuation-based, so a slow shard must fail
             # boundedly rather than consume the transport's entire 120s call.
             deadline = started + poll_budget_seconds
-            while payload.get("status") == "running" and isinstance(process_id, str) and time.monotonic() < deadline:
+            while payload.get("status") == "running" and isinstance(command_id, str) and time.monotonic() < deadline:
                 poll_started = time.monotonic()
                 remaining_ms = max(1, min(30000, int((deadline - poll_started) * 1000)))
                 poll_result = self._task_poll(
                     {
-                        "process_session_id": process_id,
+                        "process_session_id": command_id,
                         "workspace_id": workspace_id,
                         "working_tree_id": worktree_id,
                         "yield_time_ms": remaining_ms,
@@ -16643,18 +16743,18 @@ class WrapperRuntime:
                 # bounded poll budget in a tight loop while the task is live.
                 if payload.get("status") == "running" and time.monotonic() - poll_started < 0.05:
                     time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
-            if payload.get("status") == "running" and isinstance(process_id, str):
+            if payload.get("status") == "running" and isinstance(command_id, str):
                 try:
                     self._task_stop(
-                        {"process_session_id": process_id, "workspace_id": workspace_id, "working_tree_id": worktree_id, "signal": "TERM"},
+                        {"process_session_id": command_id, "workspace_id": workspace_id, "working_tree_id": worktree_id, "signal": "TERM"},
                         request_id=None,
                     )
                 except ToolFailure:
                     pass
                 return {"exit_code": None, "output": "verification exceeded bounded poll window", "duration_ms": (time.monotonic() - started) * 1000, "timed_out": True}
-            if isinstance(process_id, str):
-                self.approved_sessions.discard(process_id)
-                self._task_process_sessions.pop(process_id, None)
+            if isinstance(command_id, str):
+                self.approved_sessions.discard(command_id)
+                self._task_process_sessions.pop(command_id, None)
             output = payload.get("preview") or payload.get("summary") or ""
             return {
                 "exit_code": payload.get("exit_code"),
@@ -16852,7 +16952,6 @@ class WrapperRuntime:
             result = runtime.call_tool(
                 "read_file",
                 {"path": empty_source.path, "max_bytes": min(max_item_bytes * 2, 131072)},
-                request_id=None,
             )
             structured = result.get("structuredContent")
             if result.get("isError") or not isinstance(structured, dict) or not isinstance(structured.get("content"), str):
@@ -19510,7 +19609,7 @@ class WrapperRuntime:
             write_session_sidecar(session)
             sidecar_written = True
             self._persist_development_session(session)
-            runtime = Runtime(target, permission_mode="safe", transport="stdio")
+            runtime = Runtime(target, permission_mode="safe", transport=self.transport)
             self.development_sessions[session_id] = session
             self._development_runtimes[session_id] = runtime
             task = self._director_ledger.bind_execution(
@@ -20882,7 +20981,7 @@ class WrapperRuntime:
             if key not in {"lease_id", "session_id", "workspace_id", "workspace_ref", "working_tree_id"}
         }
         upstream_args["patch"] = upstream_patch
-        result = _runtime.call_tool("apply_patch", upstream_args, request_id=request_id)
+        result = _runtime.call_tool("apply_patch", upstream_args)
         if not result.get("isError"):
             workspace_id = self._director_logical_workspace_id(entry)
             managed_revert: dict[str, object]
@@ -21788,7 +21887,7 @@ class WrapperRuntime:
         # Do not start a subprocess unless the Director store is available to
         # record the exact routing receipt that makes a later poll safe.
         self._require_persistence()
-        result = runtime.call_tool("exec_command", call_args, request_id=request_id)
+        result = runtime.call_tool("exec_command", call_args)
         structured = result.get("structuredContent")
         if isinstance(structured, dict):
             structured = _redact_output(structured)
@@ -21798,20 +21897,33 @@ class WrapperRuntime:
                 if development_session_id and development_session_id.startswith("session:")
                 else (entry.identifier if entry.identifier.startswith("session:") else None)
             )
-            process_session_id = structured.get("session_id")
-            if isinstance(process_session_id, str) and process_session_id:
+            # coding-tools-mcp 0.3 returns a workspace-owned command_id. The
+            # outer process_session_id/session_id fields below are retained
+            # only as DevMCP response aliases for existing clients; all
+            # routing, persistence, and upstream calls use command_id.
+            if result.get("isError"):
+                return result
+            command_id = structured.get("command_id")
+            if not isinstance(command_id, str) or not command_id:
+                raise ToolFailure(
+                    "SESSION_BINDING_UNAVAILABLE",
+                    "The upstream runtime did not return a stable command identity.",
+                    category="runtime",
+                )
+            process_session_id = command_id
+            if isinstance(command_id, str) and command_id:
                 runtime_id = _runtime_server_instance_id(runtime)
                 if runtime_id is None:
                     try:
                         runtime.call_tool(
-                            "kill_session",
-                            {"session_id": process_session_id, "signal": "TERM"},
+                            "kill_command",
+                            {"command_id": command_id, "signal": "TERM"},
                         )
                     except Exception:
                         pass
                     raise ToolFailure(
                         "SESSION_BINDING_UNAVAILABLE",
-                        "The upstream runtime did not expose a stable process identity.",
+                        "The upstream runtime did not expose a stable command identity.",
                         category="runtime",
                     )
                 created_at = self._now()
@@ -21845,8 +21957,8 @@ class WrapperRuntime:
                 except Exception:
                     try:
                         runtime.call_tool(
-                            "kill_session",
-                            {"session_id": process_session_id, "signal": "TERM"},
+                            "kill_command",
+                            {"command_id": command_id, "signal": "TERM"},
                         )
                     except Exception:
                         pass
@@ -21868,6 +21980,9 @@ class WrapperRuntime:
                     "workspace_id": self._director_logical_workspace_id(entry),
                     "development_session_id": bound_session_id,
                     "working_tree_id": working_tree_id,
+                    "command_id": command_id,
+                    "process_session_id": command_id,
+                    "session_id": command_id,
                     **structured,
                 },
                 error=bool(result.get("isError")),
@@ -21875,22 +21990,22 @@ class WrapperRuntime:
         return result
 
     def _task_poll(self, args: dict[str, Any], *, request_id: str | int | None) -> dict[str, Any]:
-        process_session_id = self._process_session_id_arg(args)
-        if not isinstance(process_session_id, str) or process_session_id not in self.approved_sessions:
-            if not isinstance(process_session_id, str):
+        command_id = self._process_session_id_arg(args)
+        if not isinstance(command_id, str) or command_id not in self.approved_sessions:
+            if not isinstance(command_id, str):
                 raise ToolFailure("SESSION_NOT_APPROVED", "Only a session returned by run_task may be polled.", category="security")
-        binding, entry, runtime = self._task_process_binding_for_action(process_session_id, args)
+        process_session_id = command_id
+        binding, entry, runtime = self._task_process_binding_for_action(command_id, args)
         self._require_profile("DEVELOPMENT", entry=entry)
         result = runtime.call_tool(
             "write_stdin",
             {
-                "session_id": process_session_id,
+                "command_id": command_id,
                 "chars": str(args.get("chars", "")),
                 "yield_time_ms": min(int(args.get("yield_time_ms", 10000)), 30000),
                 "max_output_bytes": min(int(args.get("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)), 1048576),
                 "verbosity": "preview",
             },
-            request_id=request_id,
         )
         structured = result.get("structuredContent")
         if isinstance(structured, dict):
@@ -21901,16 +22016,16 @@ class WrapperRuntime:
         return result
 
     def _task_stop(self, args: dict[str, Any], *, request_id: str | int | None) -> dict[str, Any]:
-        process_session_id = self._process_session_id_arg(args)
-        if not isinstance(process_session_id, str) or process_session_id not in self.approved_sessions:
-            if not isinstance(process_session_id, str):
+        command_id = self._process_session_id_arg(args)
+        if not isinstance(command_id, str) or command_id not in self.approved_sessions:
+            if not isinstance(command_id, str):
                 raise ToolFailure("SESSION_NOT_APPROVED", "Only a session returned by run_task may be stopped.", category="security")
-        binding, entry, runtime = self._task_process_binding_for_action(process_session_id, args)
+        process_session_id = command_id
+        binding, entry, runtime = self._task_process_binding_for_action(command_id, args)
         self._require_profile("DEVELOPMENT", entry=entry)
         result = runtime.call_tool(
-            "kill_session",
-            {"session_id": process_session_id, "signal": str(args.get("signal", "TERM")), "max_output_bytes": DEFAULT_MAX_OUTPUT_BYTES, "verbosity": "preview"},
-            request_id=request_id,
+            "kill_command",
+            {"command_id": command_id, "signal": str(args.get("signal", "TERM")), "max_output_bytes": DEFAULT_MAX_OUTPUT_BYTES, "verbosity": "preview"},
         )
         structured = result.get("structuredContent")
         if isinstance(structured, dict):
@@ -21926,14 +22041,23 @@ class WrapperRuntime:
 
     @staticmethod
     def _process_session_id_arg(args: dict[str, Any]) -> object:
+        command_id = args.get("command_id")
         process_session_id = args.get("process_session_id")
         legacy_session_id = args.get("session_id")
-        if process_session_id is not None and legacy_session_id is not None and process_session_id != legacy_session_id:
+        supplied = {
+            "command_id": command_id,
+            "process_session_id": process_session_id,
+            "session_id": legacy_session_id,
+        }
+        non_null = [(name, value) for name, value in supplied.items() if value is not None]
+        if len({value for _name, value in non_null}) > 1:
             raise ToolFailure(
                 "SESSION_BINDING_MISMATCH",
-                "process_session_id and the legacy session_id alias must identify the same process.",
+                "command_id, process_session_id, and the legacy session_id alias must identify the same command.",
                 category="permission",
             )
+        if command_id is not None:
+            return command_id
         return process_session_id if process_session_id is not None else legacy_session_id
 
     def _validate_process_binding_args(self, args: dict[str, Any], binding: TaskProcessBinding) -> None:
@@ -22333,7 +22457,6 @@ class WrapperRuntime:
         status_result = runtime.call_tool(
             "git_status",
             {"path": ".", "include_untracked": True, "max_entries": 1000},
-            request_id=None,
         )
         status_payload = status_result.get("structuredContent") if isinstance(status_result, Mapping) else None
         if not isinstance(status_payload, Mapping):
@@ -22388,7 +22511,6 @@ class WrapperRuntime:
                 read_result = runtime.call_tool(
                     "read_file",
                     {"path": path, "max_bytes": 8192},
-                    request_id=None,
                 )
                 read_payload = read_result.get("structuredContent") if isinstance(read_result, Mapping) else None
                 if isinstance(read_result, Mapping) and read_result.get("isError"):
@@ -22499,7 +22621,7 @@ class WrapperRuntime:
 
             def safe_reader(path: str) -> str:
                 self._check_path_args("read_file", {"path": path})
-                result = runtime.call_tool("read_file", {"path": path, "max_bytes": 65536}, request_id=None)
+                result = runtime.call_tool("read_file", {"path": path, "max_bytes": 65536})
                 payload = result.get("structuredContent")
                 if result.get("isError") or not isinstance(payload, Mapping) or not isinstance(payload.get("content"), str):
                     raise ValueError("workspace file could not be read safely")
@@ -22509,7 +22631,6 @@ class WrapperRuntime:
                 result = runtime.call_tool(
                     "git_diff",
                     {"paths": [path], "staged": False, "unstaged": True, "context_lines": 3, "max_bytes": 16384},
-                    request_id=None,
                 )
                 payload = result.get("structuredContent")
                 if result.get("isError") or not isinstance(payload, Mapping):
@@ -22580,7 +22701,6 @@ class WrapperRuntime:
                             "context_lines": 3,
                             "max_bytes": per_path_bytes,
                         },
-                        request_id=None,
                     )
                     payload = result.get("structuredContent") if isinstance(result, Mapping) else None
                     if bool(result.get("isError")) if isinstance(result, Mapping) else True:
@@ -22987,40 +23107,44 @@ class WrapperRuntime:
                         owner_id=context.owner_id,
                         artifact_role=artifact_role,
                     )
+                authorization_token = _AUTHORIZED_CAPABILITY_RUNTIME.set(self)
                 try:
-                    result = gateway.execute(
-                        preflight_id,
-                        capability_id,
-                        params,
-                        context,
-                        confirmation=confirmation,
-                    )
-                except StableCapabilityGatewayError as exc:
-                    if audited:
-                        if defer_activation_audit:
-                            # provisioning_events is application state and remains
-                            # part of the activation semantic pin.  The request
-                            # lifecycle audit is recorded by call_tool and is the
-                            # only excluded table; defer this secondary audit
-                            # stream until the controller CAS window has closed.
+                    try:
+                        result = gateway.execute(
+                            preflight_id,
+                            capability_id,
+                            params,
+                            context,
+                            confirmation=confirmation,
+                        )
+                    except StableCapabilityGatewayError as exc:
+                        if audited:
+                            if defer_activation_audit:
+                                # provisioning_events is application state and remains
+                                # part of the activation semantic pin.  The request
+                                # lifecycle audit is recorded by call_tool and is the
+                                # only excluded table; defer this secondary audit
+                                # stream until the controller CAS window has closed.
+                                self._record_runtime_provisioning_event(
+                                    capability_id=capability_id,
+                                    workspace_id=context.workspace_id,
+                                    event_outcome="REQUESTED",
+                                    request_id=audit_request_id,
+                                    owner_id=context.owner_id,
+                                    artifact_role=artifact_role,
+                                )
                             self._record_runtime_provisioning_event(
                                 capability_id=capability_id,
                                 workspace_id=context.workspace_id,
-                                event_outcome="REQUESTED",
+                                event_outcome="FAILED",
                                 request_id=audit_request_id,
                                 owner_id=context.owner_id,
+                                error_code=exc.code,
                                 artifact_role=artifact_role,
                             )
-                        self._record_runtime_provisioning_event(
-                            capability_id=capability_id,
-                            workspace_id=context.workspace_id,
-                            event_outcome="FAILED",
-                            request_id=audit_request_id,
-                            owner_id=context.owner_id,
-                            error_code=exc.code,
-                            artifact_role=artifact_role,
-                        )
-                    raise
+                        raise
+                finally:
+                    _AUTHORIZED_CAPABILITY_RUNTIME.reset(authorization_token)
                 if audited:
                     if defer_activation_audit:
                         # Keep provisioning_events pinned; this write is audit
@@ -23059,6 +23183,14 @@ class WrapperRuntime:
         request_id: str | int | None,
         request_generation: int | None = None,
     ) -> dict[str, Any]:
+        if self._public_surface_profile == PROFILE_STABLE_GATEWAY and name in HIDDEN_REGISTRY_MUTATION_TOOLS:
+            if _AUTHORIZED_CAPABILITY_RUNTIME.get() is not self:
+                raise ToolFailure(
+                    "CAPABILITY_AUTHORITY_REQUIRED",
+                    "Registry mutations must execute through the stable capability Gateway.",
+                    category="permission",
+                    details={"reason": "capability_authority_required"},
+                )
         if name == "readonly_path":
             return _result(name, self._readonly_path(args))
         if name == "workspace_list":
@@ -23276,9 +23408,28 @@ class WrapperRuntime:
         *,
         request_id: str | int | None = None,
         request_generation: int | None = None,
+        context: RequestContext | None = None,
     ) -> dict[str, Any]:
         args = arguments or {}
         try:
+            # ``call_tool`` is also the internal runtime boundary used by
+            # Gateway delegation and compatibility tests.  The stable
+            # surface restriction is a client-facing policy, so enforce it
+            # when a transport/request context is present; internal calls
+            # still use the dedicated Gateway authorization guard below for
+            # registry mutations.
+            authorized_public_names = _AUTHORIZED_PUBLIC_TOOL_NAMES.get()
+            if (
+                self._public_surface_profile == PROFILE_STABLE_GATEWAY
+                and context is not None
+                and name not in (authorized_public_names or frozenset(STABLE_PUBLIC_TOOL_NAMES))
+            ):
+                raise ToolFailure(
+                    "POLICY_HIDDEN",
+                    f"Tool is not exposed by chatgpt-dev-mcp: {name}",
+                    category="permission",
+                    details={"reason": "policy_hidden"},
+                )
             if self._requires_active_session_synchronization(name, args):
                 self._synchronize_active_session()
             if name in STABLE_GATEWAY_TOOL_NAMES:
@@ -23292,7 +23443,7 @@ class WrapperRuntime:
                 )
             if name in HIDDEN_UPSTREAM_TOOLS:
                 raise JsonRpcError(-32602, f"Tool is not exposed by chatgpt-dev-mcp: {name}", {"reason": "policy_hidden"})
-            return self._route_upstream(name, args, request_id=request_id)
+            return self._route_upstream(name, args, request_id=request_id, context=context)
         except ToolFailure as exc:
             return _result(
                 name,
@@ -23338,15 +23489,59 @@ class WrapperRuntime:
                 error=True,
             )
 
-    def call_tool(self, name: str, arguments: dict[str, Any] | None, *, request_id: str | int | None = None) -> dict[str, Any]:
+    def _record_wrapper_tool_trace(
+        self,
+        name: str,
+        result: Mapping[str, Any],
+        started_at: float,
+        context: RequestContext | None,
+    ) -> None:
+        """Record wrapper-owned calls using the coding-tools 0.3 contract."""
+
+        structured = result.get("structuredContent") if isinstance(result, Mapping) else None
+        error_payload = structured.get("error") if isinstance(structured, Mapping) else None
+        error_code = error_payload.get("code") if isinstance(error_payload, Mapping) else None
+        truncated = bool(
+            isinstance(structured, Mapping)
+            and (
+                structured.get("truncated")
+                or structured.get("stdout_truncated")
+                or structured.get("stderr_truncated")
+                or structured.get("stdout_omitted_bytes")
+                or structured.get("stderr_omitted_bytes")
+            )
+        )
+        try:
+            self.telemetry.record_tool_call(
+                name,
+                ok=not bool(result.get("isError")),
+                error_code=str(error_code) if error_code else None,
+                duration_ms=max(0, int((time.monotonic() - started_at) * 1000)),
+                truncated=truncated,
+                context=context,
+            )
+        except Exception:
+            # Telemetry is observational and must never change tool outcome.
+            return
+
+    def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None,
+        *,
+        request_id: str | int | None = None,
+        context: RequestContext | None = None,
+    ) -> dict[str, Any]:
         """Run one tool while keeping transport lifecycle separate from policy state."""
 
+        started_at = time.monotonic()
         args = arguments or {}
+        effective_request_id = request_id if request_id is not None else current_request_id()
         mutating = self._restart_tool_is_mutating(name, args)
         dispatch_context = self._mutation_dispatch_lock if mutating else nullcontext()
         with dispatch_context:
             if mutating and self._restart_fence_token is not None:
-                return _result(
+                result = _result(
                     name,
                     _error_payload(
                         "RUNTIME_RESTART_FENCED",
@@ -23359,10 +23554,12 @@ class WrapperRuntime:
                     ),
                     error=True,
                 )
+                self._record_wrapper_tool_trace(name, result, started_at, context)
+                return result
             record = None
             try:
                 try:
-                    record = self._begin_request_lifecycle(name, args, request_id)
+                    record = self._begin_request_lifecycle(name, args, effective_request_id)
                 except RequestConflict as exc:
                     details = {
                         "reason": exc.reason,
@@ -23371,7 +23568,7 @@ class WrapperRuntime:
                         "side_effect_started": exc.record.side_effect_started,
                         "recovery_action": "inspect_active_request" if not exc.record.terminal else "retry_with_new_request_id",
                     }
-                    return _result(
+                    result = _result(
                         name,
                         _error_payload(
                             "OPERATION_ALREADY_STARTED" if exc.reason == "operation_already_started" else "REQUEST_ID_REUSE",
@@ -23381,15 +23578,25 @@ class WrapperRuntime:
                         ),
                         error=True,
                     )
+                    self._record_wrapper_tool_trace(name, result, started_at, context)
+                    return result
                 result = self._call_tool_untracked(
                     name,
                     args,
-                    request_id=request_id,
+                    request_id=effective_request_id,
                     request_generation=record.key.transport_generation if record is not None else None,
+                    context=context,
                 )
                 self._finish_request_lifecycle(record, result)
+                self._record_wrapper_tool_trace(name, result, started_at, context)
                 return result
-            except Exception:
+            except Exception as exc:
+                self._record_wrapper_tool_trace(
+                    name,
+                    {"isError": True, "structuredContent": {"error": {"code": type(exc).__name__}}},
+                    started_at,
+                    context,
+                )
                 self._fail_request_lifecycle(record, exception=True)
                 raise
 

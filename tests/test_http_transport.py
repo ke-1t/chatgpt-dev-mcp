@@ -202,6 +202,8 @@ class HttpTransportTests(unittest.TestCase):
         self.assertNotEqual(session_a, session_b)
         self.assertTrue(init_a["result"]["capabilities"]["tools"]["listChanged"])
         self.assertTrue(init_b["result"]["capabilities"]["tools"]["listChanged"])
+        self.assertEqual(self.server.sessions.get(session_a).runtime.telemetry._base_properties["transport"], "http")
+        self.assertEqual(self.server.sessions.get(session_b).runtime.telemetry._base_properties["transport"], "http")
 
         for session_id, request_id in ((session_a, "a-list"), (session_b, "b-list")):
             status, _headers, response = _request(
@@ -243,6 +245,34 @@ class HttpTransportTests(unittest.TestCase):
         self.assertTrue(candidate_attempt["result"]["isError"])
         self.assertEqual(candidate_attempt["result"]["structuredContent"]["error"]["code"], "DISCOVERY_CANDIDATE_NOT_FOUND")
 
+    def test_hidden_registry_mutations_are_not_callable_over_http(self) -> None:
+        session_id, _ = _initialize(self.port, "hidden-init")
+        target = self.home / "Developer" / "direct-http-project"
+        before = self.config.read_bytes()
+        project_params = {
+            "project_id": "direct-http-project",
+            "directory_name": "direct-http-project",
+            "root_id": "developer",
+            "initialize_git": True,
+            "project_type": "EMPTY",
+        }
+        for name, arguments in (
+            ("workspace_project_create", project_params),
+            (
+                "workspace_project_policy_update",
+                {
+                    "workspace_id": "fixture",
+                    "expected_config_digest": "0" * 64,
+                    "isolated_development": {"auto_resume_sessions": True},
+                },
+            ),
+        ):
+            response = _call(self.port, session_id, f"hidden-{name}", name, arguments)
+            self.assertTrue(response["result"]["isError"], response)
+            self.assertEqual(response["result"]["structuredContent"]["error"]["code"], "POLICY_HIDDEN")
+        self.assertFalse(target.exists())
+        self.assertEqual(self.config.read_bytes(), before)
+
     def test_connection_observability_tracks_http_lifecycle_without_raw_session_ids(self) -> None:
         session_id, _ = _initialize(self.port, "obs-init")
         created = self.server.connection_observability.snapshot(session_id)
@@ -281,6 +311,45 @@ class HttpTransportTests(unittest.TestCase):
         assert after_delete is not None
         self.assertIsNotNone(after_delete["last_disconnect_at"])
         self.assertEqual(after_delete["disconnect_reason"], "deleted_session")
+
+    def test_v26_hidden_registry_mutations_are_not_callable_over_http(self) -> None:
+        session_id, _ = _initialize(self.port, "v26-hidden-init", path="/mcp/v26-canary")
+        target = self.home / "Developer" / "direct-v26-project"
+        before = self.config.read_bytes()
+        project_params = {
+            "project_id": "direct-v26-project",
+            "directory_name": "direct-v26-project",
+            "root_id": "developer",
+            "initialize_git": True,
+            "project_type": "EMPTY",
+        }
+        for name, arguments in (
+            ("workspace_project_create", project_params),
+            (
+                "workspace_project_policy_update",
+                {
+                    "workspace_id": "fixture",
+                    "expected_config_digest": "0" * 64,
+                    "isolated_development": {"auto_resume_sessions": True},
+                },
+            ),
+        ):
+            response = _request(
+                self.port,
+                {
+                    "jsonrpc": "2.0",
+                    "id": f"v26-hidden-{name}",
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                },
+                session_id=session_id,
+                path="/mcp/v26-canary",
+            )[2]
+            assert response is not None
+            self.assertTrue(response["result"]["isError"], response)
+            self.assertEqual(response["result"]["structuredContent"]["error"]["code"], "POLICY_HIDDEN")
+        self.assertFalse(target.exists())
+        self.assertEqual(self.config.read_bytes(), before)
 
     def test_v25_canary_endpoint_matches_schema_and_is_session_isolated(self) -> None:
         canonical_session, _canonical_init = _initialize(self.port, "canonical-init", path="/mcp")
@@ -369,6 +438,21 @@ class HttpTransportTests(unittest.TestCase):
         self.assertNotIn("git_verified_commit", names)
         self.assertIn("doctor_connection", names)
 
+        status, _headers, security_audit = _request(
+            self.port,
+            {
+                "jsonrpc": "2.0",
+                "id": "v26-security-audit",
+                "method": "tools/call",
+                "params": {"name": "security_audit", "arguments": {"workspace_id": "repo-a"}},
+            },
+            session_id=v26_session,
+            path="/mcp/v26-canary",
+        )
+        self.assertEqual(status, 200)
+        assert security_audit is not None
+        self.assertFalse(security_audit["result"].get("isError", False), security_audit)
+
         status, _headers, audit_log = _request(
             self.port,
             {
@@ -382,8 +466,8 @@ class HttpTransportTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         assert audit_log is not None
-        self.assertFalse(audit_log["result"].get("isError", False), audit_log)
-        self.assertTrue(audit_log["result"]["structuredContent"]["ok"])
+        self.assertTrue(audit_log["result"].get("isError", False), audit_log)
+        self.assertEqual(audit_log["result"]["structuredContent"]["error"]["code"], "POLICY_HIDDEN")
 
         observation = self.server.connection_observability.snapshot(v26_session)
         assert observation is not None

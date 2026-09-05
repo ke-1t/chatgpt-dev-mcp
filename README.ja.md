@@ -6,6 +6,18 @@
 
 ## 役割
 
+上流 `coding-tools-mcp==0.3.0` の実行契約を採用しています。コマンドの
+正規ハンドルは `command_id`、出力参照は
+`command:<id>:stdout` / `command:<id>:stderr`、明示的な終了は
+`kill_command` です。`notifications/cancelled` は MCP リクエストを
+キャンセルするだけで、workspace のコマンドを終了させません。
+`get_default_cwd` / `set_default_cwd` は公開せず、コマンドには
+workspace 相対の `workdir` を指定します。外側の `session_id` は
+development workspace の権限境界として残り、`process_session_id` と
+旧来のプロセス用 `session_id` は command handle の互換別名です。v26
+では `command_id` を直接案内します。STDIO の物理 child は論理的な
+再接続をまたいで workspace runtime と保持出力を維持します。
+
 このプロジェクトの役割は「コードを書くAIそのもの」ではなく、ChatGPT が複数のローカルprojectを安全に管理するための境界を提供することです。
 
 - 登録済みprojectだけをworkspaceとして扱う
@@ -37,6 +49,7 @@ DevMCPを利用する場合の詳細な構造と境界は [`ARCHITECTURE.md`](AR
 - workspace selector は任意pathではなくregistry IDを使用します。
 - `READ_ONLY` が既定です。
 - sensitive path、credential-like file、symlink escape、workspace外pathを拒否します。
+- v26の`readonly_path` durable handleはserver-owned HTTP logical connection、session、選択workspaceにbindingされ、別clientや別workspaceからのstatus/list/readを拒否します。同一logical connectionの再接続だけが継続利用できます。
 - arbitrary shell command は公開しません。
 - local config registry はoperator-ownedです。
 - Git commit / push / integration は通常の編集とは別の境界です。

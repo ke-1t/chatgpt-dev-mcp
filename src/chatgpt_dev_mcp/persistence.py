@@ -88,6 +88,8 @@ _READONLY_ROOT_SCHEMA_MISSING = "missing"
 _READONLY_ROOT_SCHEMA_NATIVE = "native"
 _READONLY_ROOT_SCHEMA_LEGACY_SCOPED_SUPERSET = "legacy_scoped_superset"
 _READONLY_ROOT_SCOPE_NAMESPACE = "chatgpt-dev-mcp:v26-readonly-root:v1"
+_READONLY_ROOT_BINDING_SCHEMA_MISSING = "missing"
+_READONLY_ROOT_BINDING_SCHEMA_NATIVE = "native"
 _OPERATOR_RECEIPT_METADATA_FIELDS = frozenset(
     {
         "record_type",
@@ -218,6 +220,10 @@ class ReadOnlyRootConflictError(PersistenceError):
 
 class ReadOnlyRootScopeConflictError(PersistenceCorruptError):
     """A target-owned scoped row contains another authority binding."""
+
+
+class ReadOnlyRootBindingConflictError(PersistenceError):
+    """A durable READ_ONLY root already has a conflicting owner binding."""
 
 
 def _utc_now() -> str:
@@ -578,6 +584,133 @@ def _readonly_root_record(value: object) -> dict[str, Any]:
     }
 
 
+def _readonly_root_identity_record(value: object) -> dict[str, str]:
+    """Validate the server-owned identity used to filter durable roots."""
+
+    record = _mapping(value, name="readonly root identity")
+    fields = {"owner_id", "workspace_id", "session_id"}
+    if set(record) != fields:
+        raise PersistenceError("readonly root identity fields are invalid")
+    owner_id = _identifier(record.get("owner_id"), name="owner_id", maximum=256)
+    workspace_raw = record.get("workspace_id")
+    workspace_id = "" if workspace_raw in (None, "") else _identifier(workspace_raw, name="workspace_id", maximum=160)
+    session_id = _identifier(record.get("session_id"), name="session_id", maximum=256)
+    return {
+        "owner_id": owner_id,
+        "workspace_id": workspace_id,
+        "session_id": session_id,
+    }
+
+
+def _readonly_root_binding_record(value: object) -> dict[str, str]:
+    """Validate the server-owned identity attached to one durable root."""
+
+    record = _mapping(value, name="readonly root binding")
+    fields = {"root_id", "owner_id", "workspace_id", "session_id"}
+    if set(record) != fields:
+        raise PersistenceError("readonly root binding fields are invalid")
+    root_id = _identifier(record.get("root_id"), name="root_id", maximum=160)
+    if not re.fullmatch(r"readonly:[A-Za-z0-9_-]{1,150}", root_id):
+        raise PersistenceError("readonly root binding id has an invalid format")
+    return {
+        "root_id": root_id,
+        **_readonly_root_identity_record(
+            {field: record.get(field) for field in ("owner_id", "workspace_id", "session_id")}
+        ),
+    }
+
+
+def inspect_readonly_root_bindings_schema(
+    connection: sqlite3.Connection,
+    *,
+    allow_missing: bool = True,
+) -> str:
+    """Validate the additive durable READ_ONLY owner-binding table."""
+
+    try:
+        table = connection.execute(
+            "SELECT type, sql FROM sqlite_master WHERE name = 'readonly_root_bindings'"
+        ).fetchone()
+        if table is None:
+            if allow_missing:
+                return _READONLY_ROOT_BINDING_SCHEMA_MISSING
+            raise PersistenceCorruptError("readonly_root_bindings table is missing")
+        if str(table[0]).lower() != "table" or not isinstance(table[1], str):
+            raise PersistenceCorruptError("readonly_root_bindings is not a regular table")
+        table_sql = " ".join(table[1].upper().split())
+        if any(
+            marker in table_sql
+            for marker in (
+                "CHECK",
+                "COLLATE",
+                "CONSTRAINT",
+                "FOREIGN KEY",
+                "GENERATED",
+                "ON CONFLICT",
+                "REFERENCES",
+                "STRICT",
+                "UNIQUE",
+                "WITHOUT ROWID",
+            )
+        ):
+            raise PersistenceCorruptError("readonly_root_bindings contains unsupported constraints")
+        columns = tuple(
+            (
+                str(row[1]),
+                str(row[2]).upper(),
+                int(row[3]),
+                None if row[4] is None else str(row[4]).strip(),
+                int(row[5]),
+            )
+            for row in connection.execute(
+                'PRAGMA table_info("readonly_root_bindings")'
+            ).fetchall()
+        )
+        expected = (
+            ("root_id", "TEXT", 0, None, 1),
+            ("owner_id", "TEXT", 1, None, 0),
+            ("workspace_id", "TEXT", 1, "''", 0),
+            ("session_id", "TEXT", 1, None, 0),
+        )
+        if columns != expected:
+            raise PersistenceCorruptError("readonly_root_bindings columns are incompatible")
+        xinfo_rows = connection.execute(
+            'PRAGMA table_xinfo("readonly_root_bindings")'
+        ).fetchall()
+        if len(xinfo_rows) != len(columns) or any(len(row) >= 7 and int(row[6]) != 0 for row in xinfo_rows):
+            raise PersistenceCorruptError("readonly_root_bindings contains hidden columns")
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'readonly_root_bindings' LIMIT 1"
+        ).fetchone() is not None:
+            raise PersistenceCorruptError("readonly_root_bindings has unsupported triggers")
+        if connection.execute(
+            'PRAGMA foreign_key_list("readonly_root_bindings")'
+        ).fetchone() is not None:
+            raise PersistenceCorruptError("readonly_root_bindings has unsupported foreign keys")
+        index_rows = connection.execute(
+            'PRAGMA index_list("readonly_root_bindings")'
+        ).fetchall()
+        for index_row in index_rows:
+            index_name = str(index_row[1])
+            unique = bool(int(index_row[2]))
+            origin = str(index_row[3]).lower() if len(index_row) > 3 else ""
+            if unique and not (origin == "pk" or index_name.startswith("sqlite_autoindex_readonly_root_bindings_")):
+                raise PersistenceCorruptError("readonly_root_bindings has an unsupported unique index")
+            if origin == "pk" or index_name.startswith("sqlite_autoindex_readonly_root_bindings_"):
+                continue
+            info_rows = connection.execute(
+                f"PRAGMA index_info({_quote_sqlite_identifier(index_name)})"
+            ).fetchall()
+            if any(row[2] is None for row in info_rows):
+                raise PersistenceCorruptError("readonly_root_bindings has an expression index")
+            raise PersistenceCorruptError("readonly_root_bindings has unsupported indexes")
+        return _READONLY_ROOT_BINDING_SCHEMA_NATIVE
+    except PersistenceError:
+        raise
+    except (TypeError, ValueError, sqlite3.DatabaseError) as exc:
+        raise PersistenceCorruptError("readonly_root_bindings schema could not be inspected") from exc
+
+
 def _task_process_binding_record(value: object) -> dict[str, Any]:
     """Validate the complete, non-secret process binding record."""
 
@@ -703,6 +836,7 @@ class SqliteDirectorStore:
         self._lock = threading.RLock()
         self._writes_since_maintenance = 0
         self._readonly_roots_schema = _READONLY_ROOT_SCHEMA_MISSING
+        self._readonly_root_bindings_schema = _READONLY_ROOT_BINDING_SCHEMA_MISSING
         self._schema_version = self._bootstrap_read_only() if self._read_only else self._bootstrap()
 
     @property
@@ -851,6 +985,10 @@ class SqliteDirectorStore:
                 require_indexes=True,
                 scope_path=self.path,
             )
+            self._readonly_root_bindings_schema = inspect_readonly_root_bindings_schema(
+                connection,
+                allow_missing=True,
+            )
             if connection.execute("PRAGMA foreign_key_check").fetchall():
                 raise PersistenceCorruptError("SQLite read-only foreign key validation failed")
             return version
@@ -986,6 +1124,7 @@ class SqliteDirectorStore:
             self._ensure_integration_approval_grants_table(connection)
             self._ensure_provisioning_events_table(connection)
             self._ensure_readonly_roots_table(connection)
+            self._ensure_readonly_root_bindings_table(connection)
             self._ensure_request_lifecycle_events_table(connection)
             self._ensure_review_receipts_table(connection)
             self._ensure_session_archive_tables(connection)
@@ -1931,6 +2070,26 @@ class SqliteDirectorStore:
             allow_missing=False,
             require_indexes=True,
             scope_path=self.path,
+        )
+
+    def _ensure_readonly_root_bindings_table(self, connection: sqlite3.Connection) -> None:
+        """Create and validate the additive owner-binding table."""
+
+        schema = inspect_readonly_root_bindings_schema(connection, allow_missing=True)
+        if schema == _READONLY_ROOT_BINDING_SCHEMA_MISSING:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS readonly_root_bindings (
+                    root_id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL DEFAULT '',
+                    session_id TEXT NOT NULL
+                )
+                """
+            )
+        self._readonly_root_bindings_schema = inspect_readonly_root_bindings_schema(
+            connection,
+            allow_missing=False,
         )
 
     @staticmethod
@@ -3726,6 +3885,40 @@ class SqliteDirectorStore:
             result.append(item)
         return result
 
+    def _readonly_root_binding_clause(
+        self,
+        binding: Mapping[str, Any] | None,
+    ) -> tuple[str, tuple[object, ...]]:
+        """Return a fail-closed filter for one optional server-owned binding."""
+
+        if binding is None:
+            if self._readonly_root_bindings_schema == _READONLY_ROOT_BINDING_SCHEMA_MISSING:
+                # A pre-hardening read-only store has no binding table. Its
+                # legacy roots are intentionally treated as unbound; a
+                # binding-required manager cannot use this branch.
+                return "1 = 1", ()
+            if self._readonly_root_bindings_schema != _READONLY_ROOT_BINDING_SCHEMA_NATIVE:
+                raise PersistenceCorruptError("readonly_root_bindings schema is unavailable")
+            return (
+                "NOT EXISTS (SELECT 1 FROM readonly_root_bindings binding "
+                "WHERE binding.root_id = readonly_roots.root_id)",
+                (),
+            )
+        record = _mapping(binding, name="readonly root binding")
+        if "root_id" in record:
+            normalized = _readonly_root_binding_record(binding)
+            identity = normalized
+        else:
+            identity = _readonly_root_identity_record(binding)
+        if self._readonly_root_bindings_schema != _READONLY_ROOT_BINDING_SCHEMA_NATIVE:
+            raise PersistenceCorruptError("readonly_root_bindings schema is unavailable")
+        return (
+            "EXISTS (SELECT 1 FROM readonly_root_bindings binding "
+            "WHERE binding.root_id = readonly_roots.root_id "
+            "AND binding.owner_id = ? AND binding.workspace_id = ? AND binding.session_id = ?)",
+            (identity["owner_id"], identity["workspace_id"], identity["session_id"]),
+        )
+
     def _readonly_root_scope_clause(self) -> tuple[str, tuple[object, ...]]:
         if self._readonly_roots_schema == _READONLY_ROOT_SCHEMA_LEGACY_SCOPED_SUPERSET:
             return (
@@ -3803,6 +3996,11 @@ class SqliteDirectorStore:
                 f"DELETE FROM readonly_roots WHERE root_id = ? AND ({scope_clause})",
                 (row[0], *scope_values),
             )
+            if self._readonly_root_bindings_schema == _READONLY_ROOT_BINDING_SCHEMA_NATIVE:
+                connection.execute(
+                    "DELETE FROM readonly_root_bindings WHERE root_id = ?",
+                    (row[0],),
+                )
 
     def save_readonly_root(
         self,
@@ -3811,10 +4009,14 @@ class SqliteDirectorStore:
         now: float | None = None,
         max_active: int = _READONLY_ROOT_MAX_ACTIVE,
         max_history: int = _READONLY_ROOT_MAX_HISTORY,
+        binding: Mapping[str, Any] | None = None,
     ) -> None:
         """Atomically register one bounded opaque READ_ONLY filesystem handle."""
 
         record = _readonly_root_record(value)
+        normalized_binding = None if binding is None else _readonly_root_binding_record(binding)
+        if normalized_binding is not None and normalized_binding["root_id"] != record["root_id"]:
+            raise PersistenceError("readonly root binding id does not match the root id")
         if not isinstance(max_active, int) or not 1 <= max_active <= 1024:
             raise PersistenceError("readonly root active bound is invalid")
         current = _finite_number(
@@ -3830,6 +4032,13 @@ class SqliteDirectorStore:
                 (record["root_id"],),
             ).fetchone() is not None:
                 raise ReadOnlyRootConflictError("readonly root id already exists")
+            if self._readonly_root_bindings_schema == _READONLY_ROOT_BINDING_SCHEMA_NATIVE and connection.execute(
+                "SELECT 1 FROM readonly_root_bindings WHERE root_id = ?",
+                (record["root_id"],),
+            ).fetchone() is not None:
+                raise ReadOnlyRootBindingConflictError("readonly root binding id already exists")
+            if normalized_binding is not None and self._readonly_root_bindings_schema != _READONLY_ROOT_BINDING_SCHEMA_NATIVE:
+                raise PersistenceCorruptError("readonly_root_bindings schema is unavailable")
             active = int(
                 connection.execute(
                     f"SELECT COUNT(*) FROM readonly_roots WHERE ({scope_clause}) AND state = 'active'",
@@ -3868,73 +4077,108 @@ class SqliteDirectorStore:
                 )
             else:
                 raise PersistenceCorruptError("readonly_roots schema is unavailable")
+            if normalized_binding is not None:
+                connection.execute(
+                    "INSERT INTO readonly_root_bindings(root_id, owner_id, workspace_id, session_id) VALUES (?, ?, ?, ?)",
+                    (
+                        normalized_binding["root_id"],
+                        normalized_binding["owner_id"],
+                        normalized_binding["workspace_id"],
+                        normalized_binding["session_id"],
+                    ),
+                )
 
         self.run_write(write)
 
-    def load_readonly_root(self, root_id: object) -> dict[str, Any] | None:
+    def load_readonly_root(
+        self,
+        root_id: object,
+        *,
+        binding: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         identifier = _identifier(root_id, name="root_id", maximum=160)
         scope_clause, scope_values = self._readonly_root_scope_clause()
+        binding_clause, binding_values = self._readonly_root_binding_clause(binding)
         with self._transaction(write=False) as connection:
             if self._readonly_roots_schema == _READONLY_ROOT_SCHEMA_LEGACY_SCOPED_SUPERSET:
                 _assert_readonly_root_scope_clean(connection, self.path)
             row = connection.execute(
                 f"SELECT {self._readonly_root_select_columns()} FROM readonly_roots "
-                f"WHERE root_id = ? AND ({scope_clause})",
-                (identifier, *scope_values),
+                f"WHERE root_id = ? AND ({scope_clause}) AND ({binding_clause})",
+                (identifier, *scope_values, *binding_values),
             ).fetchone()
         if row is None:
             return None
         return self._readonly_root_row(row)
 
-    def load_readonly_roots(self) -> list[dict[str, Any]]:
+    def load_readonly_roots(
+        self,
+        *,
+        binding: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         scope_clause, scope_values = self._readonly_root_scope_clause()
+        binding_clause, binding_values = self._readonly_root_binding_clause(binding)
         with self._transaction(write=False) as connection:
             if self._readonly_roots_schema == _READONLY_ROOT_SCHEMA_LEGACY_SCOPED_SUPERSET:
                 _assert_readonly_root_scope_clean(connection, self.path)
             rows = connection.execute(
                 f"SELECT {self._readonly_root_select_columns()} FROM readonly_roots "
-                f"WHERE ({scope_clause}) ORDER BY created_at, root_id",
-                scope_values,
+                f"WHERE ({scope_clause}) AND ({binding_clause}) ORDER BY created_at, root_id",
+                (*scope_values, *binding_values),
             ).fetchall()
         return [record for row in rows if (record := self._readonly_root_row(row)) is not None]
 
-    def close_readonly_root(self, root_id: object, *, now: float | None = None) -> dict[str, Any] | None:
+    def close_readonly_root(
+        self,
+        root_id: object,
+        *,
+        now: float | None = None,
+        binding: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         identifier = _identifier(root_id, name="root_id", maximum=160)
         current = _finite_number(time.time() if now is None else now, name="readonly_root_now")
         scope_clause, scope_values = self._readonly_root_scope_clause()
+        binding_clause, binding_values = self._readonly_root_binding_clause(binding)
 
         def write(connection: sqlite3.Connection) -> None:
             if self._readonly_roots_schema == _READONLY_ROOT_SCHEMA_LEGACY_SCOPED_SUPERSET:
                 _assert_readonly_root_scope_clean(connection, self.path)
             connection.execute(
                 f"UPDATE readonly_roots SET state = 'closed', updated_at = ? "
-                f"WHERE root_id = ? AND ({scope_clause})",
-                (current, identifier, *scope_values),
+                f"WHERE root_id = ? AND ({scope_clause}) AND ({binding_clause})",
+                (current, identifier, *scope_values, *binding_values),
             )
             self._prune_readonly_root_rows(connection, now=current)
 
         self.run_write(write)
-        return self.load_readonly_root(identifier)
+        return self.load_readonly_root(identifier, binding=binding)
 
-    def mark_readonly_root_stale(self, root_id: object, *, now: float | None = None) -> dict[str, Any] | None:
+    def mark_readonly_root_stale(
+        self,
+        root_id: object,
+        *,
+        now: float | None = None,
+        binding: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         """Persist an identity/policy failure without revoking other handles."""
 
         identifier = _identifier(root_id, name="root_id", maximum=160)
         current = _finite_number(time.time() if now is None else now, name="readonly_root_now")
         scope_clause, scope_values = self._readonly_root_scope_clause()
+        binding_clause, binding_values = self._readonly_root_binding_clause(binding)
 
         def write(connection: sqlite3.Connection) -> None:
             if self._readonly_roots_schema == _READONLY_ROOT_SCHEMA_LEGACY_SCOPED_SUPERSET:
                 _assert_readonly_root_scope_clean(connection, self.path)
             connection.execute(
                 f"UPDATE readonly_roots SET state = 'stale', updated_at = ? "
-                f"WHERE root_id = ? AND ({scope_clause}) AND state = 'active'",
-                (current, identifier, *scope_values),
+                f"WHERE root_id = ? AND ({scope_clause}) AND ({binding_clause}) AND state = 'active'",
+                (current, identifier, *scope_values, *binding_values),
             )
             self._prune_readonly_root_rows(connection, now=current)
 
         self.run_write(write)
-        return self.load_readonly_root(identifier)
+        return self.load_readonly_root(identifier, binding=binding)
 
     def _cleanup_readonly_roots(
         self,
@@ -3946,13 +4190,23 @@ class SqliteDirectorStore:
         if self._readonly_roots_schema == _READONLY_ROOT_SCHEMA_LEGACY_SCOPED_SUPERSET:
             _assert_readonly_root_scope_clean(connection, self.path)
         scope_clause, scope_values = self._readonly_root_scope_clause()
-        cursor = connection.execute(
-            f"DELETE FROM readonly_roots WHERE ({scope_clause}) AND state <> 'active' AND updated_at < ?",
+        expired_rows = connection.execute(
+            f"SELECT root_id FROM readonly_roots WHERE ({scope_clause}) AND state <> 'active' AND updated_at < ?",
             (*scope_values, cutoff),
-        )
-        removed = cursor.rowcount
+        ).fetchall()
+        for row in expired_rows:
+            connection.execute(
+                f"DELETE FROM readonly_roots WHERE root_id = ? AND ({scope_clause})",
+                (row[0], *scope_values),
+            )
+            if self._readonly_root_bindings_schema == _READONLY_ROOT_BINDING_SCHEMA_NATIVE:
+                connection.execute(
+                    "DELETE FROM readonly_root_bindings WHERE root_id = ?",
+                    (row[0],),
+                )
+        removed = len(expired_rows)
         rows = connection.execute(
-            f"SELECT rowid FROM readonly_roots WHERE ({scope_clause}) AND state <> 'active' "
+            f"SELECT rowid, root_id FROM readonly_roots WHERE ({scope_clause}) AND state <> 'active' "
             "ORDER BY updated_at DESC, rowid DESC LIMIT -1 OFFSET ?",
             (*scope_values, max_rows),
         ).fetchall()
@@ -3961,7 +4215,18 @@ class SqliteDirectorStore:
                 f"DELETE FROM readonly_roots WHERE rowid = ? AND ({scope_clause})",
                 (row[0], *scope_values),
             )
+            if self._readonly_root_bindings_schema == _READONLY_ROOT_BINDING_SCHEMA_NATIVE:
+                connection.execute(
+                    "DELETE FROM readonly_root_bindings WHERE root_id = ?",
+                    (row[1],),
+                )
             removed += 1
+        if self._readonly_root_bindings_schema == _READONLY_ROOT_BINDING_SCHEMA_NATIVE:
+            connection.execute(
+                "DELETE FROM readonly_root_bindings "
+                "WHERE NOT EXISTS (SELECT 1 FROM readonly_roots "
+                "WHERE readonly_roots.root_id = readonly_root_bindings.root_id)",
+            )
         return removed
 
     def save_request_lifecycle_event(self, value: object) -> None:
@@ -5442,9 +5707,11 @@ __all__ = [
     "PersistenceCorruptError",
     "PersistenceError",
     "ReadOnlyRootCapacityError",
+    "ReadOnlyRootBindingConflictError",
     "ReadOnlyRootConflictError",
     "ReadOnlyRootScopeConflictError",
     "SqliteDirectorStore",
     "director_db_path",
+    "inspect_readonly_root_bindings_schema",
     "inspect_readonly_roots_schema",
 ]

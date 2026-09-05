@@ -261,9 +261,9 @@ class PolicyTests(unittest.TestCase):
 
         project_root = Path(__file__).resolve().parents[1]
         pyproject = (project_root / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('"coding-tools-mcp==0.2.3"', pyproject)
+        self.assertIn('"coding-tools-mcp==0.3.0"', pyproject)
         uv_lock = (project_root / "uv.lock").read_text(encoding="utf-8")
-        self.assertIn('specifier = "==0.2.3"', uv_lock)
+        self.assertIn('specifier = "==0.3.0"', uv_lock)
         runtime = WrapperRuntime()
         try:
             metadata = runtime.call_tool("server_info", {})["structuredContent"]["tool_schema"]

@@ -34,12 +34,15 @@
 - General-file roots normally require explicit local `READ_ONLY` registration.
   A bounded exception is `readonly_path`: v25 mints a process-local,
   TTL-limited handle, while v26 stores the same minimal handle identity in the
-  existing Director SQLite database for cross-child status/list/read calls.
-  The v26 row is bounded, expires without sliding on access, contains no
-  caller authority, and is read-only apart from its lifecycle state. Both
-  surfaces pin device/inode identity, use no-follow traversal, reject
-  traversal and symlink escapes, and cannot become workspace, execution, Git,
-  DEVELOPMENT, or writer authority.
+  existing Director SQLite database for cross-child status/list/read calls
+  within the same server-owned HTTP logical connection. The durable row is
+  bound to its owner/session and selected workspace, so a different client or
+  workspace cannot enumerate or read it. The v26 row is bounded, expires
+  without sliding on access, contains no caller authority, and is read-only
+  apart from its lifecycle state. Both surfaces pin device/inode identity, use
+  no-follow traversal, reject traversal and symlink escapes, and cannot become
+  workspace, execution, Git, DEVELOPMENT, or writer authority. STDIO remains
+  process-local and does not use the HTTP binding.
 - Host filesystem mutation is isolated from the workspace command boundary.
   `host_file_preflight` accepts only `trash` or `delete` plus bounded absolute
   or home-relative target paths, canonicalizes and classifies each target, and

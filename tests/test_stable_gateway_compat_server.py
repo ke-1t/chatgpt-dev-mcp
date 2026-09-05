@@ -27,12 +27,14 @@ class StableGatewayCompatibilityServerTests(unittest.TestCase):
         repo.mkdir()
         (repo / "README.md").write_text("fixture\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        discovery_root = root / "home" / "Developer"
+        discovery_root.mkdir(parents=True)
         config = root / "config.json"
         config.write_text(
             json.dumps(
                 {
                     "version": 1,
-                    "roots": [{"id": "developer", "path": str(root), "mode": "PROJECT_DISCOVERY"}],
+                    "roots": [{"id": "developer", "path": str(discovery_root), "mode": "PROJECT_DISCOVERY"}],
                     "workspaces": {
                         "fixture": {
                             "path": str(repo),
@@ -192,7 +194,7 @@ class StableGatewayCompatibilityServerTests(unittest.TestCase):
                         "project_type": "EMPTY",
                         "auto_start_development": False,
                     }
-                    target = root / "new-project"
+                    target = root / "home" / "Developer" / "new-project"
                     preflight_outer = runtime.call_tool(
                         "capability_preflight",
                         {"capability_id": "workspace_project_create", "params": params},
@@ -213,6 +215,71 @@ class StableGatewayCompatibilityServerTests(unittest.TestCase):
                     self.assertTrue(denied["isError"], denied)
                     self.assertEqual(denied["structuredContent"]["error"]["code"], "CAPABILITY_APPROVAL_REQUIRED")
                     self.assertFalse(target.exists())
+
+                    applied = runtime.call_tool(
+                        "capability_execute",
+                        {
+                            "preflight_id": preflight["preflight_id"],
+                            "capability_id": "workspace_project_create",
+                            "params": params,
+                            "confirmation": preflight["approval"]["confirmation"],
+                        },
+                    )
+                    self.assertFalse(applied["isError"], applied)
+                    self.assertTrue(target.is_dir())
+                finally:
+                    runtime.close()
+
+    def test_hidden_registry_mutations_are_denied_outside_gateway(self) -> None:
+        from coding_tools_mcp.protocol import RequestContext
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self._fixture(root)
+            environment, runtime_type = self._runtime(root)
+            with environment:
+                runtime = runtime_type()
+                try:
+                    target = root / "direct-project"
+                    before = config.read_bytes()
+                    project_params = {
+                        "project_id": "direct-project",
+                        "directory_name": "direct-project",
+                        "root_id": "developer",
+                        "initialize_git": True,
+                        "project_type": "EMPTY",
+                    }
+                    for name, params in (
+                        ("workspace_project_create", project_params),
+                        (
+                            "workspace_project_policy_update",
+                            {
+                                "workspace_id": "fixture",
+                                "expected_config_digest": "0" * 64,
+                                "isolated_development": {"auto_resume_sessions": True},
+                            },
+                        ),
+                    ):
+                        result = runtime.call_tool(
+                            name,
+                            params,
+                            context=RequestContext(era="legacy", protocol_version="2025-11-25"),
+                        )
+                        self.assertTrue(result["isError"], result)
+                        self.assertEqual(result["structuredContent"]["error"]["code"], "POLICY_HIDDEN")
+                        self.assertEqual(result["structuredContent"]["error"]["details"]["reason"], "policy_hidden")
+                    self.assertFalse(target.exists())
+                    self.assertEqual(config.read_bytes(), before)
+
+                    # The internal handler is not a client-visible bypass either:
+                    # only the Gateway's authorization context may invoke it.
+                    with self.assertRaises(Exception) as denied_internal:
+                        runtime._custom_call(  # noqa: SLF001 - direct bypass regression
+                            "workspace_project_create",
+                            project_params,
+                            request_id=None,
+                        )
+                    self.assertEqual(getattr(denied_internal.exception, "code", None), "CAPABILITY_AUTHORITY_REQUIRED")
                 finally:
                     runtime.close()
 

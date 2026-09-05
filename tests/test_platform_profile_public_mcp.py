@@ -38,16 +38,23 @@ class PlatformProfilePublicMcpTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.previous_config = os.environ.get("LOCAL_DEV_MCP_CONFIG")
+        self.previous_surface = os.environ.get("CHATGPT_DEV_MCP_SURFACE")
         os.environ["LOCAL_DEV_MCP_CONFIG"] = str(self.config)
+        os.environ["CHATGPT_DEV_MCP_SURFACE"] = "stable_gateway"
 
     def tearDown(self) -> None:
         if self.previous_config is None:
             os.environ.pop("LOCAL_DEV_MCP_CONFIG", None)
         else:
             os.environ["LOCAL_DEV_MCP_CONFIG"] = self.previous_config
+        if self.previous_surface is None:
+            os.environ.pop("CHATGPT_DEV_MCP_SURFACE", None)
+        else:
+            os.environ["CHATGPT_DEV_MCP_SURFACE"] = self.previous_surface
         self.tempdir.cleanup()
 
     def test_platform_profile_registration_is_preflight_gated_and_one_shot(self) -> None:
+        from coding_tools_mcp.protocol import RequestContext
         from chatgpt_dev_mcp.server import WrapperRuntime
 
         runtime = WrapperRuntime()
@@ -62,7 +69,7 @@ class PlatformProfilePublicMcpTests(unittest.TestCase):
             self.assertEqual(described["exposure"], "registry")
 
             before = self.config.read_text(encoding="utf-8")
-            browser_preflight = runtime.call_tool(
+            direct = runtime.call_tool(
                 "workspace_platform_profile_register_preflight",
                 {
                     "workspace_id": "fixture",
@@ -72,40 +79,90 @@ class PlatformProfilePublicMcpTests(unittest.TestCase):
                     "viewport_width": 1280,
                     "viewport_height": 720,
                 },
-            )["structuredContent"]
+                context=RequestContext(era="legacy", protocol_version="2025-11-25"),
+            )
+            self.assertTrue(direct["isError"], direct)
+            self.assertEqual(direct["structuredContent"]["error"]["code"], "POLICY_HIDDEN")
+            browser_params = {
+                "workspace_id": "fixture",
+                "kind": "browser",
+                "profile_id": "managed-fixture-browser",
+                "allowed_origins": ["http://127.0.0.1:8765"],
+                "viewport_width": 1280,
+                "viewport_height": 720,
+            }
+            browser_preflight_result = runtime.call_tool(
+                "capability_preflight",
+                {
+                    "workspace_id": "fixture",
+                    "capability_id": "platform.profile.register",
+                    "params": browser_params,
+                },
+            )
+            self.assertFalse(browser_preflight_result["isError"], browser_preflight_result)
+            browser_preflight = browser_preflight_result["structuredContent"]
             self.assertEqual(self.config.read_text(encoding="utf-8"), before)
             self.assertTrue(browser_preflight["approval_required"])
-            self.assertFalse(browser_preflight["external_execution"])
+            self.assertFalse(browser_preflight.get("external_execution", False))
 
-            browser_applied = runtime.call_tool(
-                "workspace_platform_profile_register",
-                {"preflight_id": browser_preflight["preflight_id"], "confirmation": browser_preflight["approval"]["confirmation"]},
-            )["structuredContent"]
+            browser_applied_result = runtime.call_tool(
+                "capability_execute",
+                {
+                    "workspace_id": "fixture",
+                    "preflight_id": browser_preflight["preflight_id"],
+                    "capability_id": "platform.profile.register",
+                    "params": browser_params,
+                    "confirmation": browser_preflight["approval"]["confirmation"],
+                },
+            )
+            self.assertFalse(browser_applied_result["isError"], browser_applied_result)
+            browser_applied = browser_applied_result["structuredContent"]["result"]
             self.assertEqual(browser_applied["status"], "registered")
-            self.assertFalse(browser_applied["external_execution"])
+            self.assertFalse(browser_applied.get("external_execution", False))
 
             replay = runtime.call_tool(
-                "workspace_platform_profile_register",
-                {"preflight_id": browser_preflight["preflight_id"], "confirmation": browser_preflight["approval"]["confirmation"]},
+                "capability_execute",
+                {
+                    "workspace_id": "fixture",
+                    "preflight_id": browser_preflight["preflight_id"],
+                    "capability_id": "platform.profile.register",
+                    "params": browser_params,
+                    "confirmation": browser_preflight["approval"]["confirmation"],
+                },
             )
             self.assertTrue(replay["isError"])
 
-            desktop_preflight = runtime.call_tool(
-                "workspace_platform_profile_register_preflight",
+            desktop_params = {
+                "workspace_id": "fixture",
+                "kind": "desktop",
+                "profile_id": "managed-fixture-desktop",
+                "bundle_id": "com.example.fixture",
+                "health_url": "http://127.0.0.1:8765/health",
+            }
+            desktop_preflight_result = runtime.call_tool(
+                "capability_preflight",
                 {
                     "workspace_id": "fixture",
-                    "kind": "desktop",
-                    "profile_id": "managed-fixture-desktop",
-                    "bundle_id": "com.example.fixture",
-                    "health_url": "http://127.0.0.1:8765/health",
+                    "capability_id": "platform.profile.register",
+                    "params": desktop_params,
                 },
-            )["structuredContent"]
-            desktop_applied = runtime.call_tool(
-                "workspace_platform_profile_register",
-                {"preflight_id": desktop_preflight["preflight_id"], "confirmation": desktop_preflight["approval"]["confirmation"]},
-            )["structuredContent"]
+            )
+            self.assertFalse(desktop_preflight_result["isError"], desktop_preflight_result)
+            desktop_preflight = desktop_preflight_result["structuredContent"]
+            desktop_applied_result = runtime.call_tool(
+                "capability_execute",
+                {
+                    "workspace_id": "fixture",
+                    "preflight_id": desktop_preflight["preflight_id"],
+                    "capability_id": "platform.profile.register",
+                    "params": desktop_params,
+                    "confirmation": desktop_preflight["approval"]["confirmation"],
+                },
+            )
+            self.assertFalse(desktop_applied_result["isError"], desktop_applied_result)
+            desktop_applied = desktop_applied_result["structuredContent"]["result"]
             self.assertEqual(desktop_applied["status"], "registered")
-            self.assertFalse(desktop_applied["external_execution"])
+            self.assertFalse(desktop_applied.get("external_execution", False))
 
             document = json.loads(self.config.read_text(encoding="utf-8"))
             platform = document["workspaces"]["fixture"]["platform"]

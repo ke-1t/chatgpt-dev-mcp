@@ -34,9 +34,10 @@ flowchart LR
 
 ## Runtime layers
 
-1. **MCP transport:** JSON MCP STDIO behind a long-lived broker. Each logical
-   connection owns one fresh `WrapperRuntime`, `InitializeReplayState`, and
-   request registry, moving through `NEW` → `INITIALIZING` → `READY` and
+1. **MCP transport:** JSON MCP STDIO behind a long-lived broker. The physical
+   child owns one `WrapperRuntime` and its upstream 0.3 workspace command
+   manager; each logical connection gets fresh `InitializeReplayState` and
+   request-registry state, moving through `NEW` → `INITIALIZING` → `READY` and
    closing through `CLOSING` → `CLOSED`. The measured pre-operation duplicate
    initialize is replayed once. After normal operation, the next initialize
    retires the old runtime and starts a new one; request-id epochs, `id=0`,
@@ -245,8 +246,11 @@ normally explicit opt-in `READ_ONLY` roots. `readonly_path` is a narrow
 ordinary-directory read boundary. The frozen v25 surface keeps its historical
 process-local handle behavior; the v26 canary uses the existing bounded,
 TTL-checked Director registry so the handle identity can be resolved across
-MCP children. Neither surface can turn the handle into workspace, Git,
-execution, DEVELOPMENT, or writer authority.
+MCP children of the same server-owned HTTP logical connection. The persisted
+binding includes the owner/session and selected workspace identity, so a
+different client or workspace cannot enumerate or read the handle. STDIO
+remains process-local and unbound. Neither surface can turn the handle into
+workspace, Git, execution, DEVELOPMENT, or writer authority.
 
 ## Director parallel-development control plane
 

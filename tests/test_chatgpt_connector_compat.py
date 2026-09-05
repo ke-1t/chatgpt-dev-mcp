@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import chatgpt_dev_mcp.chatgpt_connector_compat as connector_compat
 from chatgpt_dev_mcp.chatgpt_connector_compat import dispatch_rpc_compat, serve_stdio_compat
+from coding_tools_mcp.telemetry import SessionTelemetry
 
 
 class CountingRuntime:
@@ -22,14 +23,26 @@ class CountingRuntime:
     def __init__(self) -> None:
         self.initialize_calls: list[dict[str, object] | None] = []
         self.closed = False
+        self.telemetry = SessionTelemetry(permission_mode="safe", transport="test")
 
-    def initialize(self, client_info: dict[str, object] | None = None) -> dict[str, object]:
+    def initialize(
+        self,
+        client_info: dict[str, object] | None = None,
+        protocol_version: str = protocol_version,
+    ) -> dict[str, object]:
         self.initialize_calls.append(client_info)
+        self.initialized = True
         return {
-            "protocolVersion": self.protocol_version,
+            "protocolVersion": protocol_version,
             "capabilities": {"tools": {"listChanged": True}},
             "serverInfo": {"name": "counting-runtime", "version": "test"},
         }
+
+    def discover_payload(self) -> dict[str, object]:
+        return {"supportedVersions": ["2026-07-28"]}
+
+    def server_identity(self) -> dict[str, object]:
+        return {"name": "counting-runtime", "version": "test"}
 
     def list_tools(self) -> dict[str, object]:
         return {"tools": [{"name": "ping"}]}
@@ -39,15 +52,20 @@ class CountingRuntime:
         name: str,
         arguments: dict[str, object],
         *,
-        request_id: str | int | None = None,
+        context: object | None = None,
     ) -> dict[str, object]:
-        return {"name": name, "arguments": arguments, "request_id": request_id}
+        return {
+            "name": name,
+            "arguments": arguments,
+            "context_protocol_version": getattr(context, "protocol_version", None),
+        }
 
     def cancel_request(self, request_id: str | int) -> None:
         return None
 
     def close(self) -> None:
         self.closed = True
+        self.telemetry.finish()
 
 
 class BlockingRuntime(CountingRuntime):
@@ -56,11 +74,15 @@ class BlockingRuntime(CountingRuntime):
         self.initialize_started = threading.Event()
         self.release_initialize = threading.Event()
 
-    def initialize(self, client_info: dict[str, object] | None = None) -> dict[str, object]:
+    def initialize(
+        self,
+        client_info: dict[str, object] | None = None,
+        protocol_version: str = CountingRuntime.protocol_version,
+    ) -> dict[str, object]:
         self.initialize_started.set()
         if not self.release_initialize.wait(timeout=5):
             raise RuntimeError("initialize test gate timed out")
-        return super().initialize(client_info)
+        return super().initialize(client_info, protocol_version)
 
 
 def run_requests(runtime: CountingRuntime, requests: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -343,14 +365,14 @@ class ChatGPTConnectorCompatTests(unittest.TestCase):
                 name: str,
                 arguments: dict[str, object],
                 *,
-                request_id: str | int | None = None,
+                context: object | None = None,
             ) -> dict[str, object]:
                 if name == "write":
                     self.write_calls += 1
                     self.write_started.set()
                     if not self.release_write.wait(timeout=5):
                         raise RuntimeError("write test gate timed out")
-                return super().call_tool(name, arguments, request_id=request_id)
+                return super().call_tool(name, arguments, context=context)
 
         runtimes: list[BlockingWriteRuntime] = []
 
@@ -410,7 +432,7 @@ class ChatGPTConnectorCompatTests(unittest.TestCase):
 
         self.assertEqual(runtime.initialize_calls, [{"name": "chatgpt", "version": "test"}])
         self.assertEqual(responses[0]["id"], "openai-mcp-discover")
-        self.assertEqual(responses[0]["error"]["code"], -32002)
+        self.assertEqual(responses[0]["error"]["code"], -32601)
         self.assertEqual(responses[1]["id"], 1)
         self.assertEqual(responses[2]["id"], 0)
         self.assertEqual(responses[1]["result"], responses[2]["result"])
@@ -499,6 +521,79 @@ class ChatGPTConnectorCompatTests(unittest.TestCase):
         self.assertEqual(responses[1]["result"], responses[2]["result"])
         self.assertTrue(all("id" in response for response in responses))
         self.assertTrue(all(response.get("method") != "notifications/tools/list_changed" for response in responses))
+
+    def test_hidden_registry_mutations_are_not_callable_over_stdio(self) -> None:
+        from chatgpt_dev_mcp.server import WrapperRuntime
+
+        with tempfile.TemporaryDirectory(prefix="chatgpt-dev-mcp-stdio-security-") as temp:
+            root = Path(temp)
+            home = root / "home"
+            developer = home / "Developer"
+            developer.mkdir(parents=True)
+            config = home / "config.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roots": [{"id": "developer", "path": "~/Developer", "mode": "PROJECT_DISCOVERY"}],
+                        "workspaces": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            before = config.read_bytes()
+            with patch.dict(
+                os.environ,
+                {
+                    "HOME": str(home),
+                    "LOCAL_DEV_MCP_CONFIG": str(config),
+                    "CHATGPT_DEV_MCP_SURFACE": "stable_gateway",
+                },
+            ):
+                runtime = WrapperRuntime()
+                responses = run_requests(
+                    runtime,
+                    [
+                        initialize_request(1),
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "workspace_project_create",
+                                "arguments": {
+                                    "project_id": "direct-stdio-project",
+                                    "directory_name": "direct-stdio-project",
+                                    "root_id": "developer",
+                                    "initialize_git": True,
+                                    "project_type": "EMPTY",
+                                },
+                            },
+                        },
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 3,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "workspace_project_policy_update",
+                                "arguments": {
+                                    "workspace_id": "fixture",
+                                    "expected_config_digest": "0" * 64,
+                                    "isolated_development": {"auto_resume_sessions": True},
+                                },
+                            },
+                        },
+                    ],
+                )
+
+            try:
+                for response in responses[1:]:
+                    self.assertTrue(response["result"]["isError"], response)
+                    self.assertEqual(response["result"]["structuredContent"]["error"]["code"], "POLICY_HIDDEN")
+                self.assertFalse((developer / "direct-stdio-project").exists())
+                self.assertEqual(config.read_bytes(), before)
+            finally:
+                runtime.close()
 
     def test_connector_reconnect_rotates_protocol_generation_after_discovery(self) -> None:
         runtimes: list[CountingRuntime] = []
@@ -935,7 +1030,7 @@ class ChatGPTConnectorCompatTests(unittest.TestCase):
         )
 
         self.assertEqual(len(runtimes), 1)
-        self.assertEqual(responses[2]["error"]["code"], -32002)
+        self.assertEqual(responses[2]["error"]["code"], -32601)
         self.assertNotIn("error", responses[3])
         self.assertNotIn("error", responses[4])
 

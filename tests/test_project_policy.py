@@ -73,6 +73,7 @@ class ProjectPolicyToolTests(unittest.TestCase):
                 "HOME": str(home),
                 "LOCAL_DEV_MCP_CONFIG": str(config),
                 "LOCAL_DEV_MCP_DATA_DIR": str(root / "state"),
+                "CHATGPT_DEV_MCP_SURFACE": "legacy",
             },
         ):
             runtime = WrapperRuntime()
@@ -138,6 +139,7 @@ class ProjectPolicyToolTests(unittest.TestCase):
                 "HOME": str(home),
                 "LOCAL_DEV_MCP_CONFIG": str(config),
                 "LOCAL_DEV_MCP_DATA_DIR": str(root / "state"),
+                "CHATGPT_DEV_MCP_SURFACE": "legacy",
             },
         ):
             runtime = WrapperRuntime()
@@ -203,6 +205,7 @@ class ProjectPolicyToolTests(unittest.TestCase):
                 "HOME": str(home),
                 "LOCAL_DEV_MCP_CONFIG": str(symlink),
                 "LOCAL_DEV_MCP_DATA_DIR": str(root / "state-symlink"),
+                "CHATGPT_DEV_MCP_SURFACE": "legacy",
             },
         ):
             runtime = WrapperRuntime()
@@ -219,6 +222,7 @@ class ProjectPolicyToolTests(unittest.TestCase):
                 "HOME": str(home),
                 "LOCAL_DEV_MCP_CONFIG": str(config),
                 "LOCAL_DEV_MCP_DATA_DIR": str(root / "state-readonly"),
+                "CHATGPT_DEV_MCP_SURFACE": "legacy",
             },
         ):
             runtime = WrapperRuntime()

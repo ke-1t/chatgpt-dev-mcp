@@ -20,13 +20,14 @@ class ProvisioningToolTests(unittest.TestCase):
         self.config = self.home / ".config" / "local-dev-mcp" / "config.json"
         self.config.parent.mkdir(parents=True)
         self._write_config({})
-        self.previous = {key: os.environ.get(key) for key in ("HOME", "LOCAL_DEV_MCP_CONFIG", "LOCAL_DEV_MCP_DATA_DIR", "LOCAL_DEV_MCP_WORKTREE_ROOT")}
+        self.previous = {key: os.environ.get(key) for key in ("HOME", "LOCAL_DEV_MCP_CONFIG", "LOCAL_DEV_MCP_DATA_DIR", "LOCAL_DEV_MCP_WORKTREE_ROOT", "CHATGPT_DEV_MCP_SURFACE")}
         os.environ.update(
             {
                 "HOME": str(self.home),
                 "LOCAL_DEV_MCP_CONFIG": str(self.config),
                 "LOCAL_DEV_MCP_DATA_DIR": str(self.root / "state"),
                 "LOCAL_DEV_MCP_WORKTREE_ROOT": str(self.root / "worktrees"),
+                "CHATGPT_DEV_MCP_SURFACE": "legacy",
             }
         )
 
@@ -118,7 +119,8 @@ class ProvisioningToolTests(unittest.TestCase):
         from chatgpt_dev_mcp.capability_gateway_mcp import CapabilityExecutionContext, StableCapabilityGatewayError
         from chatgpt_dev_mcp.server import WrapperRuntime
 
-        runtime = WrapperRuntime()
+        with patch.dict(os.environ, {"CHATGPT_DEV_MCP_SURFACE": "stable_gateway"}):
+            runtime = WrapperRuntime()
         context = CapabilityExecutionContext(
             workspace_id="candidate-project",
             working_tree_id="worktree:candidate",
