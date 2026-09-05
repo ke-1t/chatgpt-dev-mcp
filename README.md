@@ -168,10 +168,12 @@ ordinary local directory can also be opened temporarily with
 a process-local TTL-bound `readonly:*` capability. On `/mcp/v26-canary` it
 returns a bounded, TTL-bound handle persisted in the existing Director SQLite
 store, so `status`, `list_allowed_files`, `search_allowed_files`, and
-`read_allowed_file` may safely use the same handle from another MCP child.
-Both surfaces pin inode/device identity and use no-follow path walking; the
-handle cannot become a workspace, command, Git, DEVELOPMENT, or writer
-authority, and process restart never restores any such authority. Broad OS/user roots,
+`read_allowed_file` may safely use the same handle from another MCP child of
+the same server-owned HTTP logical connection. The owner/session and selected
+workspace binding deny the handle to a different client or workspace. Both
+surfaces pin inode/device identity and use no-follow path walking; the handle
+cannot become a workspace, command, Git, DEVELOPMENT, or writer authority,
+and process restart never restores any such authority. Broad OS/user roots,
 hidden or credential-like paths, browser/private stores, binary files, and
 secret-like contents fail closed.
 

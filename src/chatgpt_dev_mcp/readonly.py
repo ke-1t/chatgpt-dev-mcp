@@ -50,6 +50,7 @@ _SECRET_CONTENT = re.compile(
     r"\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{12,}|AKIA[0-9A-Z]{12,})\b|"
     r"(?i:\b(?:api[_-]?key|access[_-]?key|secret|token|password|passwd|client[_-]?secret)\b\s*[:=]\s*\S+)"
 )
+_ROOT_ID = re.compile(r"^readonly:[A-Za-z0-9_-]{1,150}$")
 
 
 class ReadOnlyPathError(Exception):
@@ -74,6 +75,9 @@ class ReadOnlyRoot:
     label: str | None = None
     state: str = "active"
     policy_enforced: bool = True
+    owner_id: str | None = None
+    workspace_id: str = ""
+    session_id: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -211,6 +215,10 @@ class ReadOnlyPathManager:
         clock: Callable[[], float] | None = None,
         ttl_seconds: int = ROOT_TTL_SECONDS,
         persistence: Any | None = None,
+        binding_owner_id: str | None = None,
+        binding_session_id: str | None = None,
+        workspace_id_provider: Callable[[], str] | None = None,
+        require_binding: bool = False,
     ) -> None:
         self._clock = clock or time.time
         self._ttl = max(1, min(int(ttl_seconds), ROOT_TTL_SECONDS))
@@ -218,6 +226,126 @@ class ReadOnlyPathManager:
         self._roots: dict[str, ReadOnlyRoot] = {}
         self._closed_ids: deque[str] = deque(maxlen=MAX_ROOT_ID_HISTORY)
         self._lock = threading.RLock()
+        self._binding_owner_id: str | None = None
+        self._binding_session_id: str | None = None
+        self._workspace_id_provider: Callable[[], str] = lambda: ""
+        self._require_binding = False
+        if binding_owner_id is not None or binding_session_id is not None or require_binding:
+            self.bind_identity(
+                binding_owner_id,
+                binding_session_id,
+                workspace_id_provider=workspace_id_provider,
+                require_binding=require_binding,
+            )
+
+    @staticmethod
+    def _binding_identifier(value: object, *, name: str, allow_empty: bool = False, maximum: int = 256) -> str:
+        if allow_empty and value in (None, ""):
+            return ""
+        if not isinstance(value, str) or not value or len(value) > maximum or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}", value):
+            raise ReadOnlyPathError("ROOT_BINDING_INVALID", f"{name} is not a valid server-owned identity.", category="runtime")
+        return value
+
+    def bind_identity(
+        self,
+        owner_id: object,
+        session_id: object,
+        *,
+        workspace_id_provider: Callable[[], str] | None = None,
+        require_binding: bool = True,
+    ) -> None:
+        """Attach a server-owned transport identity before durable use."""
+
+        owner = self._binding_identifier(owner_id, name="owner_id")
+        session = self._binding_identifier(session_id, name="session_id")
+        if workspace_id_provider is not None and not callable(workspace_id_provider):
+            raise ReadOnlyPathError("ROOT_BINDING_INVALID", "workspace identity provider is unavailable.", category="runtime")
+        with self._lock:
+            existing = (self._binding_owner_id, self._binding_session_id)
+            if existing != (None, None) and existing != (owner, session):
+                raise ReadOnlyPathError(
+                    "ROOT_BINDING_CONFLICT",
+                    "A READ_ONLY manager cannot change its server-owned identity.",
+                    category="conflict",
+                )
+            if any(root.state == "active" for root in self._roots.values()) and existing != (owner, session):
+                raise ReadOnlyPathError(
+                    "ROOT_BINDING_CONFLICT",
+                    "A READ_ONLY manager cannot be rebound after opening a root.",
+                    category="conflict",
+                )
+            self._binding_owner_id = owner
+            self._binding_session_id = session
+            self._workspace_id_provider = workspace_id_provider or self._workspace_id_provider
+            self._require_binding = bool(require_binding)
+
+    def _binding_identity(self) -> dict[str, str] | None:
+        owner = self._binding_owner_id
+        session = self._binding_session_id
+        if owner is None and session is None:
+            if self._require_binding:
+                raise ReadOnlyPathError(
+                    "ROOT_BINDING_UNAVAILABLE",
+                    "The server-owned READ_ONLY identity is unavailable.",
+                    category="runtime",
+                )
+            return None
+        if owner is None or session is None:
+            raise ReadOnlyPathError(
+                "ROOT_BINDING_UNAVAILABLE",
+                "The server-owned READ_ONLY identity is incomplete.",
+                category="runtime",
+            )
+        try:
+            workspace_raw = self._workspace_id_provider()
+        except Exception as exc:  # noqa: BLE001 - identity providers fail closed
+            raise ReadOnlyPathError(
+                "ROOT_BINDING_UNAVAILABLE",
+                "The server-owned workspace identity is unavailable.",
+                category="runtime",
+            ) from exc
+        workspace = self._binding_identifier(workspace_raw, name="workspace_id", allow_empty=True, maximum=160)
+        return {"owner_id": owner, "workspace_id": workspace, "session_id": session}
+
+    def _binding_for_root(self, root_id: str) -> dict[str, str] | None:
+        identity = self._binding_identity()
+        if identity is None:
+            return None
+        return {"root_id": root_id, **identity}
+
+    @staticmethod
+    def _root_binding(root: ReadOnlyRoot) -> dict[str, str] | None:
+        if root.owner_id is None and root.session_id is None:
+            return None
+        if root.owner_id is None or root.session_id is None:
+            raise ReadOnlyPathError(
+                "ROOT_BINDING_INVALID",
+                "The durable READ_ONLY root identity is incomplete.",
+                category="runtime",
+            )
+        return {
+            "root_id": root.root_id,
+            "owner_id": root.owner_id,
+            "workspace_id": root.workspace_id,
+            "session_id": root.session_id,
+        }
+
+    def _assert_root_binding(self, root: ReadOnlyRoot, *, expected: dict[str, str] | None) -> None:
+        actual = self._root_binding(root)
+        if expected is None:
+            if actual is not None:
+                raise ReadOnlyPathError(
+                    "ROOT_OWNER_MISMATCH",
+                    "The READ_ONLY root belongs to another server-owned identity.",
+                    category="permission",
+                )
+            return
+        if actual is None or any(actual.get(field) != expected.get(field) for field in ("owner_id", "workspace_id", "session_id")):
+            raise ReadOnlyPathError(
+                "ROOT_OWNER_MISMATCH",
+                "The READ_ONLY root belongs to another server-owned identity.",
+                category="permission",
+            )
 
     def _now(self) -> float:
         return float(self._clock())
@@ -265,7 +393,11 @@ class ReadOnlyPathManager:
         }
 
     @staticmethod
-    def _root_from_persistence(record: dict[str, object]) -> ReadOnlyRoot:
+    def _root_from_persistence(
+        record: dict[str, object],
+        *,
+        binding: dict[str, str] | None = None,
+    ) -> ReadOnlyRoot:
         try:
             return ReadOnlyRoot(
                 str(record["root_id"]),
@@ -278,6 +410,9 @@ class ReadOnlyPathManager:
                 float(record["expires_at"]),
                 str(record.get("label") or "") or None,
                 str(record["state"]),
+                owner_id=binding.get("owner_id") if binding is not None else None,
+                workspace_id=binding.get("workspace_id", "") if binding is not None else "",
+                session_id=binding.get("session_id") if binding is not None else None,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ReadOnlyPathError(
@@ -296,6 +431,7 @@ class ReadOnlyPathManager:
                     now=root.created_at,
                     max_active=MAX_ROOTS,
                     max_history=MAX_ROOT_ID_HISTORY,
+                    binding=self._root_binding(root),
                 )
                 return
             except ReadOnlyRootConflictError:
@@ -345,7 +481,21 @@ class ReadOnlyPathManager:
                 raise ReadOnlyPathError("LABEL_INVALID", "label must be bounded single-line text.", category="validation")
             now = self._now()
             root_id = self._new_id()
-            root = ReadOnlyRoot(root_id, requested, canonical, int(identity.st_dev), int(identity.st_ino), now, now, now + self._ttl, label.strip() if isinstance(label, str) else None)
+            binding = self._binding_identity()
+            root = ReadOnlyRoot(
+                root_id,
+                requested,
+                canonical,
+                int(identity.st_dev),
+                int(identity.st_ino),
+                now,
+                now,
+                now + self._ttl,
+                label.strip() if isinstance(label, str) else None,
+                owner_id=binding.get("owner_id") if binding is not None else None,
+                workspace_id=binding.get("workspace_id", "") if binding is not None else "",
+                session_id=binding.get("session_id") if binding is not None else None,
+            )
             self._persist_open(root)
             if self._persistence is None:
                 self._roots[root_id] = root
@@ -356,9 +506,16 @@ class ReadOnlyPathManager:
         if not isinstance(root_id, str) or not root_id:
             raise ReadOnlyPathError("ROOT_UNKNOWN", "root_id is required.", category="validation")
         root = self._roots.get(root_id)
+        if root is None and not _ROOT_ID.fullmatch(root_id):
+            raise ReadOnlyPathError(
+                "ROOT_UNKNOWN",
+                "The ephemeral READ_ONLY root is not known to this control-plane store.",
+                category="not_found",
+            )
+        expected_binding = self._binding_for_root(root_id)
         if root is None and self._persistence is not None:
             try:
-                record = self._persistence.load_readonly_root(root_id)
+                record = self._persistence.load_readonly_root(root_id, binding=expected_binding)
             except PersistenceError as exc:
                 raise ReadOnlyPathError(
                     "ROOT_PERSISTENCE_UNAVAILABLE",
@@ -366,13 +523,14 @@ class ReadOnlyPathManager:
                     category="runtime",
                 ) from exc
             if record is not None:
-                root = self._root_from_persistence(record)
+                root = self._root_from_persistence(record, binding=expected_binding)
         if root is None:
             raise ReadOnlyPathError(
                 "ROOT_CLOSED" if root_id in self._closed_ids else "ROOT_UNKNOWN",
                 "The ephemeral READ_ONLY root is not known to this control-plane store.",
                 category="not_found",
             )
+        self._assert_root_binding(root, expected=expected_binding)
         if root.state == "active" and root.expires_at <= self._now():
             root.state = "expired"
         if require_active and root.state != "active":
@@ -385,7 +543,11 @@ class ReadOnlyPathManager:
         if self._persistence is None:
             return
         try:
-            persisted = self._persistence.mark_readonly_root_stale(root.root_id, now=self._now())
+            persisted = self._persistence.mark_readonly_root_stale(
+                root.root_id,
+                now=self._now(),
+                binding=self._root_binding(root),
+            )
         except PersistenceError as exc:
             raise ReadOnlyPathError(
                 "ROOT_PERSISTENCE_UNAVAILABLE",
@@ -440,8 +602,9 @@ class ReadOnlyPathManager:
                 if self._persistence is None:
                     roots = [root.as_dict() for root in self._roots.values()]
                 else:
+                    binding = self._binding_identity()
                     try:
-                        stored = self._persistence.load_readonly_roots()
+                        stored = self._persistence.load_readonly_roots(binding=binding)
                     except PersistenceError as exc:
                         raise ReadOnlyPathError(
                             "ROOT_PERSISTENCE_UNAVAILABLE",
@@ -450,7 +613,7 @@ class ReadOnlyPathManager:
                         ) from exc
                     roots = []
                     for record in stored:
-                        root = self._root_from_persistence(record)
+                        root = self._root_from_persistence(record, binding=binding)
                         if root.state == "closed":
                             continue
                         if root.state == "active" and root.expires_at <= self._now():
@@ -467,7 +630,11 @@ class ReadOnlyPathManager:
             root = self._get(root_id, require_active=False)
             if self._persistence is not None:
                 try:
-                    closed = self._persistence.close_readonly_root(root.root_id, now=self._now())
+                    closed = self._persistence.close_readonly_root(
+                        root.root_id,
+                        now=self._now(),
+                        binding=self._root_binding(root),
+                    )
                 except PersistenceError as exc:
                     raise ReadOnlyPathError(
                         "ROOT_PERSISTENCE_UNAVAILABLE",
@@ -705,6 +872,11 @@ class ReadOnlyPathManager:
             float("inf"),
             policy_enforced=False,
         )
+        binding = self._binding_identity()
+        if binding is not None:
+            synthetic.owner_id = binding["owner_id"]
+            synthetic.workspace_id = binding["workspace_id"]
+            synthetic.session_id = binding["session_id"]
         temporary_id = f"configured:{root_id}:{secrets.token_urlsafe(8)}"
         synthetic.root_id = temporary_id
         with self._lock:

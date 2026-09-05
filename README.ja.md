@@ -49,6 +49,7 @@ DevMCPを利用する場合の詳細な構造と境界は [`ARCHITECTURE.md`](AR
 - workspace selector は任意pathではなくregistry IDを使用します。
 - `READ_ONLY` が既定です。
 - sensitive path、credential-like file、symlink escape、workspace外pathを拒否します。
+- v26の`readonly_path` durable handleはserver-owned HTTP logical connection、session、選択workspaceにbindingされ、別clientや別workspaceからのstatus/list/readを拒否します。同一logical connectionの再接続だけが継続利用できます。
 - arbitrary shell command は公開しません。
 - local config registry はoperator-ownedです。
 - Git commit / push / integration は通常の編集とは別の境界です。

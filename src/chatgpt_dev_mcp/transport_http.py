@@ -361,6 +361,21 @@ class WrapperHTTPSessionManager:
             logical_connection_id = f"http-session:{session_id}"
             setattr(runtime_owner, "logical_connection_id", logical_connection_id)
             setattr(runtime_owner, "protocol_runtime_identity", logical_connection_id)
+            bind_readonly_identity = getattr(runtime_owner, "bind_readonly_identity", None)
+            if callable(bind_readonly_identity):
+                try:
+                    bind_readonly_identity(logical_connection_id, logical_connection_id)
+                except Exception:  # noqa: BLE001 - HTTP roots must fail closed
+                    try:
+                        runtime.close()
+                    except Exception:
+                        pass
+                    raise HTTPTransportError(
+                        503,
+                        -32000,
+                        "The HTTP READ_ONLY session identity is unavailable",
+                        reason="readonly_binding_unavailable",
+                    ) from None
             bind_doctor = getattr(runtime, "bind_connection_doctor", None)
             if callable(bind_doctor) and self._observability_store is not None:
                 def _doctor(

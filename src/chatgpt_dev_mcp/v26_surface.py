@@ -139,6 +139,7 @@ def _expanded_names() -> tuple[str, ...]:
 
 
 V26_PUBLIC_TOOL_NAMES = _expanded_names()
+_V26_RUNTIME_AUTHORIZED_TOOL_NAMES = frozenset((*STABLE_PUBLIC_TOOL_NAMES, *V26_PUBLIC_TOOL_NAMES))
 
 
 def _annotations(
@@ -849,6 +850,10 @@ class V26RuntimeAdapter:
         kwargs: dict[str, Any] = {"request_id": request_id}
         if context is not None:
             kwargs["context"] = context
+        scope_factory = getattr(self._runtime, "_public_surface_scope", None)
+        if callable(scope_factory):
+            with scope_factory(_V26_RUNTIME_AUTHORIZED_TOOL_NAMES):
+                return self._runtime.call_tool(name, arguments, **kwargs)
         return self._runtime.call_tool(name, arguments, **kwargs)
 
     def close(self) -> None:

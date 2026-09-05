@@ -246,8 +246,11 @@ normally explicit opt-in `READ_ONLY` roots. `readonly_path` is a narrow
 ordinary-directory read boundary. The frozen v25 surface keeps its historical
 process-local handle behavior; the v26 canary uses the existing bounded,
 TTL-checked Director registry so the handle identity can be resolved across
-MCP children. Neither surface can turn the handle into workspace, Git,
-execution, DEVELOPMENT, or writer authority.
+MCP children of the same server-owned HTTP logical connection. The persisted
+binding includes the owner/session and selected workspace identity, so a
+different client or workspace cannot enumerate or read the handle. STDIO
+remains process-local and unbound. Neither surface can turn the handle into
+workspace, Git, execution, DEVELOPMENT, or writer authority.
 
 ## Director parallel-development control plane
 

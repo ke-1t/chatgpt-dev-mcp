@@ -522,6 +522,79 @@ class ChatGPTConnectorCompatTests(unittest.TestCase):
         self.assertTrue(all("id" in response for response in responses))
         self.assertTrue(all(response.get("method") != "notifications/tools/list_changed" for response in responses))
 
+    def test_hidden_registry_mutations_are_not_callable_over_stdio(self) -> None:
+        from chatgpt_dev_mcp.server import WrapperRuntime
+
+        with tempfile.TemporaryDirectory(prefix="chatgpt-dev-mcp-stdio-security-") as temp:
+            root = Path(temp)
+            home = root / "home"
+            developer = home / "Developer"
+            developer.mkdir(parents=True)
+            config = home / "config.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "roots": [{"id": "developer", "path": "~/Developer", "mode": "PROJECT_DISCOVERY"}],
+                        "workspaces": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            before = config.read_bytes()
+            with patch.dict(
+                os.environ,
+                {
+                    "HOME": str(home),
+                    "LOCAL_DEV_MCP_CONFIG": str(config),
+                    "CHATGPT_DEV_MCP_SURFACE": "stable_gateway",
+                },
+            ):
+                runtime = WrapperRuntime()
+                responses = run_requests(
+                    runtime,
+                    [
+                        initialize_request(1),
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "workspace_project_create",
+                                "arguments": {
+                                    "project_id": "direct-stdio-project",
+                                    "directory_name": "direct-stdio-project",
+                                    "root_id": "developer",
+                                    "initialize_git": True,
+                                    "project_type": "EMPTY",
+                                },
+                            },
+                        },
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 3,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "workspace_project_policy_update",
+                                "arguments": {
+                                    "workspace_id": "fixture",
+                                    "expected_config_digest": "0" * 64,
+                                    "isolated_development": {"auto_resume_sessions": True},
+                                },
+                            },
+                        },
+                    ],
+                )
+
+            try:
+                for response in responses[1:]:
+                    self.assertTrue(response["result"]["isError"], response)
+                    self.assertEqual(response["result"]["structuredContent"]["error"]["code"], "POLICY_HIDDEN")
+                self.assertFalse((developer / "direct-stdio-project").exists())
+                self.assertEqual(config.read_bytes(), before)
+            finally:
+                runtime.close()
+
     def test_connector_reconnect_rotates_protocol_generation_after_discovery(self) -> None:
         runtimes: list[CountingRuntime] = []
 

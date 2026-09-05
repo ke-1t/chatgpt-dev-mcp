@@ -12,7 +12,8 @@ import tempfile
 import threading
 import time
 import weakref
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -293,6 +294,7 @@ from .platform_runtime import (
 from .stable_surface import (
     PROFILE_STABLE_GATEWAY,
     STABLE_SURFACE_REVISION,
+    STABLE_PUBLIC_TOOL_NAMES,
     select_stable_surface,
     surface_mode_from_environment,
 )
@@ -1322,6 +1324,29 @@ STABLE_GATEWAY_TOOLS = [
     ),
 ]
 STABLE_GATEWAY_TOOL_NAMES = frozenset(str(item["name"]) for item in STABLE_GATEWAY_TOOLS)
+HIDDEN_REGISTRY_MUTATION_TOOLS = frozenset(
+    {
+        "workspace_register_preflight",
+        "workspace_register",
+        "workspace_unregister_preflight",
+        "workspace_unregister",
+        "workspace_registration_update_preflight",
+        "workspace_registration_update",
+        "workspace_platform_profile_register_preflight",
+        "workspace_platform_profile_register",
+        "workspace_project_policy_update",
+        "workspace_promote_development",
+        "workspace_project_create",
+    }
+)
+_AUTHORIZED_CAPABILITY_RUNTIME: ContextVar[object | None] = ContextVar(
+    "devmcp_authorized_capability_runtime",
+    default=None,
+)
+_AUTHORIZED_PUBLIC_TOOL_NAMES: ContextVar[frozenset[str] | None] = ContextVar(
+    "devmcp_authorized_public_tool_names",
+    default=None,
+)
 VERIFICATION_SHARD_POLL_BUDGET_SECONDS = 90.0
 FULL_VERIFICATION_COMMAND_TIMEOUT_MS = 600_000
 FULL_VERIFICATION_SHARD_POLL_BUDGET_SECONDS = 100.0
@@ -6613,6 +6638,34 @@ class WrapperRuntime:
             raise RuntimeError("v26 READ_ONLY continuity cannot switch after a v25 root was opened")
         self._readonly_paths = ReadOnlyPathManager(clock=self._clock, persistence=self._persistence)
         self._durable_readonly_roots = True
+
+    def current_readonly_workspace_id(self) -> str:
+        """Return the server-selected workspace identity for READ_ONLY binding."""
+
+        current = self.current
+        if current is None:
+            return ""
+        return self._director_logical_workspace_id(current)
+
+    @contextmanager
+    def _public_surface_scope(self, tool_names: frozenset[str]):
+        """Temporarily authorize the exact versioned client surface."""
+
+        token = _AUTHORIZED_PUBLIC_TOOL_NAMES.set(tool_names)
+        try:
+            yield
+        finally:
+            _AUTHORIZED_PUBLIC_TOOL_NAMES.reset(token)
+
+    def bind_readonly_identity(self, owner_id: object, session_id: object) -> None:
+        """Bind HTTP READ_ONLY handles to the server-owned session identity."""
+
+        self._readonly_paths.bind_identity(
+            owner_id,
+            session_id,
+            workspace_id_provider=self.current_readonly_workspace_id,
+            require_binding=True,
+        )
 
     def list_tools(self) -> dict[str, Any]:
         definitions = self._visible_tool_definitions()
@@ -23054,40 +23107,44 @@ class WrapperRuntime:
                         owner_id=context.owner_id,
                         artifact_role=artifact_role,
                     )
+                authorization_token = _AUTHORIZED_CAPABILITY_RUNTIME.set(self)
                 try:
-                    result = gateway.execute(
-                        preflight_id,
-                        capability_id,
-                        params,
-                        context,
-                        confirmation=confirmation,
-                    )
-                except StableCapabilityGatewayError as exc:
-                    if audited:
-                        if defer_activation_audit:
-                            # provisioning_events is application state and remains
-                            # part of the activation semantic pin.  The request
-                            # lifecycle audit is recorded by call_tool and is the
-                            # only excluded table; defer this secondary audit
-                            # stream until the controller CAS window has closed.
+                    try:
+                        result = gateway.execute(
+                            preflight_id,
+                            capability_id,
+                            params,
+                            context,
+                            confirmation=confirmation,
+                        )
+                    except StableCapabilityGatewayError as exc:
+                        if audited:
+                            if defer_activation_audit:
+                                # provisioning_events is application state and remains
+                                # part of the activation semantic pin.  The request
+                                # lifecycle audit is recorded by call_tool and is the
+                                # only excluded table; defer this secondary audit
+                                # stream until the controller CAS window has closed.
+                                self._record_runtime_provisioning_event(
+                                    capability_id=capability_id,
+                                    workspace_id=context.workspace_id,
+                                    event_outcome="REQUESTED",
+                                    request_id=audit_request_id,
+                                    owner_id=context.owner_id,
+                                    artifact_role=artifact_role,
+                                )
                             self._record_runtime_provisioning_event(
                                 capability_id=capability_id,
                                 workspace_id=context.workspace_id,
-                                event_outcome="REQUESTED",
+                                event_outcome="FAILED",
                                 request_id=audit_request_id,
                                 owner_id=context.owner_id,
+                                error_code=exc.code,
                                 artifact_role=artifact_role,
                             )
-                        self._record_runtime_provisioning_event(
-                            capability_id=capability_id,
-                            workspace_id=context.workspace_id,
-                            event_outcome="FAILED",
-                            request_id=audit_request_id,
-                            owner_id=context.owner_id,
-                            error_code=exc.code,
-                            artifact_role=artifact_role,
-                        )
-                    raise
+                        raise
+                finally:
+                    _AUTHORIZED_CAPABILITY_RUNTIME.reset(authorization_token)
                 if audited:
                     if defer_activation_audit:
                         # Keep provisioning_events pinned; this write is audit
@@ -23126,6 +23183,14 @@ class WrapperRuntime:
         request_id: str | int | None,
         request_generation: int | None = None,
     ) -> dict[str, Any]:
+        if self._public_surface_profile == PROFILE_STABLE_GATEWAY and name in HIDDEN_REGISTRY_MUTATION_TOOLS:
+            if _AUTHORIZED_CAPABILITY_RUNTIME.get() is not self:
+                raise ToolFailure(
+                    "CAPABILITY_AUTHORITY_REQUIRED",
+                    "Registry mutations must execute through the stable capability Gateway.",
+                    category="permission",
+                    details={"reason": "capability_authority_required"},
+                )
         if name == "readonly_path":
             return _result(name, self._readonly_path(args))
         if name == "workspace_list":
@@ -23347,6 +23412,24 @@ class WrapperRuntime:
     ) -> dict[str, Any]:
         args = arguments or {}
         try:
+            # ``call_tool`` is also the internal runtime boundary used by
+            # Gateway delegation and compatibility tests.  The stable
+            # surface restriction is a client-facing policy, so enforce it
+            # when a transport/request context is present; internal calls
+            # still use the dedicated Gateway authorization guard below for
+            # registry mutations.
+            authorized_public_names = _AUTHORIZED_PUBLIC_TOOL_NAMES.get()
+            if (
+                self._public_surface_profile == PROFILE_STABLE_GATEWAY
+                and context is not None
+                and name not in (authorized_public_names or frozenset(STABLE_PUBLIC_TOOL_NAMES))
+            ):
+                raise ToolFailure(
+                    "POLICY_HIDDEN",
+                    f"Tool is not exposed by chatgpt-dev-mcp: {name}",
+                    category="permission",
+                    details={"reason": "policy_hidden"},
+                )
             if self._requires_active_session_synchronization(name, args):
                 self._synchronize_active_session()
             if name in STABLE_GATEWAY_TOOL_NAMES:

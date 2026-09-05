@@ -44,9 +44,12 @@ surface the returned `readonly:*` handle is process-local and TTL-bound. On
 `/mcp/v26-canary`, its bounded handle identity is stored in the existing
 Director SQLite database, so `status`, `list_allowed_files`,
 `search_allowed_files`, and `read_allowed_file` can continue from another MCP
-child. The v26 handle still expires, is inode/device and path-confined, and
-cannot be passed to `workspace_open`, execution, Git, DEVELOPMENT, or writer
-tools. An unknown, expired, closed, or identity-drifted handle fails closed.
+child of the same server-owned HTTP logical connection. Its owner/session and
+selected workspace binding prevent a different client or workspace from using
+the handle. The v26 handle still expires, is inode/device and path-confined,
+and cannot be passed to `workspace_open`, execution, Git, DEVELOPMENT, or
+writer tools. An unknown, expired, closed, or identity-drifted handle fails
+closed.
 
 ### Bounded host filesystem mutation
 
