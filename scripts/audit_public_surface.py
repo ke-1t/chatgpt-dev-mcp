@@ -24,7 +24,7 @@ def main() -> None:
     dangerous = {
         "exec_command",
         "write_stdin",
-        "kill_session",
+        "kill_command",
         "git_merge",
         "git_rebase",
         "git_reset",

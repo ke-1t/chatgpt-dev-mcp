@@ -4,7 +4,7 @@ import unittest
 
 
 class StableRegistryInventoryTests(unittest.TestCase):
-    def test_exact_current_hidden_inventory_is_sixty_five_unique_tools(self) -> None:
+    def test_exact_current_hidden_inventory_is_sixty_three_unique_tools(self) -> None:
         from chatgpt_dev_mcp.stable_registry_inventory import (
             REGISTRY_CATEGORY_BY_TOOL,
             REGISTRY_CATEGORY_TOOL_GROUPS,
@@ -13,14 +13,14 @@ class StableRegistryInventoryTests(unittest.TestCase):
         )
         from chatgpt_dev_mcp.stable_surface import STABLE_DEDICATED_TOOL_NAMES
 
-        self.assertEqual(len(REGISTRY_TOOL_NAMES), 65)
-        self.assertEqual(len(set(REGISTRY_TOOL_NAMES)), 65)
+        self.assertEqual(len(REGISTRY_TOOL_NAMES), 63)
+        self.assertEqual(len(set(REGISTRY_TOOL_NAMES)), 63)
         self.assertFalse(set(REGISTRY_TOOL_NAMES) & set(STABLE_DEDICATED_TOOL_NAMES))
         self.assertEqual(set(REGISTRY_CATEGORY_BY_TOOL), set(REGISTRY_TOOL_NAMES))
         self.assertEqual(
             {category: len(names) for category, names in REGISTRY_CATEGORY_TOOL_GROUPS.items()},
             {
-                "platform_runtime": 6,
+                "platform_runtime": 4,
                 "workspace": 12,
                 "development": 7,
                 "files_changes": 6,
@@ -68,4 +68,3 @@ class StableRegistryInventoryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

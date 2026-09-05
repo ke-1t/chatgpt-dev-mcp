@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from coding_tools_mcp.telemetry import SessionTelemetry
 from chatgpt_dev_mcp.chatgpt_connector_compat import ConnectionRuntimeManager
 from chatgpt_dev_mcp.request_lifecycle import SideEffectClass
 
@@ -29,10 +30,16 @@ class ProcessScopedRuntime:
         self.protocol_reset_calls = 0
         self.handoff_state: dict[str, str] = {}
         self.live_process = False
+        self.telemetry = SessionTelemetry(permission_mode="safe", transport="test")
 
-    def initialize(self, client_info: dict[str, object] | None = None) -> dict[str, object]:
+    def initialize(
+        self,
+        client_info: dict[str, object] | None = None,
+        protocol_version: str = protocol_version,
+    ) -> dict[str, object]:
+        self.initialized = True
         return {
-            "protocolVersion": self.protocol_version,
+            "protocolVersion": protocol_version,
             "capabilities": {"tools": {"listChanged": True}},
             "serverInfo": {"name": "boundary-test", "version": "1"},
         }
@@ -45,9 +52,13 @@ class ProcessScopedRuntime:
         name: str,
         arguments: dict[str, object],
         *,
-        request_id: str | int | None = None,
+        context: object | None = None,
     ) -> dict[str, object]:
-        return {"name": name, "arguments": arguments, "request_id": request_id}
+        return {
+            "name": name,
+            "arguments": arguments,
+            "context_protocol_version": getattr(context, "protocol_version", None),
+        }
 
     def cancel_request(self, request_id: str | int) -> None:
         return None
@@ -65,6 +76,10 @@ class ProcessScopedRuntime:
 
     def close(self) -> None:
         self.closed = True
+        self.telemetry.finish()
+
+    def server_identity(self) -> dict[str, object]:
+        return {"name": "boundary-test", "version": "1"}
 
 
 class LogicalConnectionStateBoundaryTests(unittest.TestCase):

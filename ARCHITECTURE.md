@@ -34,9 +34,10 @@ flowchart LR
 
 ## Runtime layers
 
-1. **MCP transport:** JSON MCP STDIO behind a long-lived broker. Each logical
-   connection owns one fresh `WrapperRuntime`, `InitializeReplayState`, and
-   request registry, moving through `NEW` → `INITIALIZING` → `READY` and
+1. **MCP transport:** JSON MCP STDIO behind a long-lived broker. The physical
+   child owns one `WrapperRuntime` and its upstream 0.3 workspace command
+   manager; each logical connection gets fresh `InitializeReplayState` and
+   request-registry state, moving through `NEW` → `INITIALIZING` → `READY` and
    closing through `CLOSING` → `CLOSED`. The measured pre-operation duplicate
    initialize is replayed once. After normal operation, the next initialize
    retires the old runtime and starts a new one; request-id epochs, `id=0`,

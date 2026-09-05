@@ -17,7 +17,7 @@ class ParallelSessionIsolationTests(unittest.TestCase):
             self.assertFalse(runtime._restart_tool_is_mutating("security_audit"))
             self.assertFalse(runtime._restart_tool_is_mutating("workspace_integration_preflight"))
             self.assertTrue(runtime._restart_tool_is_mutating("browser_inspect", {"kind": "screenshot"}))
-            self.assertTrue(runtime._restart_tool_is_mutating("set_default_cwd"))
+            self.assertFalse(runtime._restart_tool_is_mutating("set_default_cwd"))
         finally:
             runtime.close()
 

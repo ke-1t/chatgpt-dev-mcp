@@ -181,6 +181,20 @@ class V26SurfaceTests(unittest.TestCase):
         self.assertFalse(definitions["browser_wait"]["annotations"]["openWorldHint"])
         self.assertFalse(definitions["browser_viewport"]["annotations"]["destructiveHint"])
 
+        for name in ("task_poll", "task_stop"):
+            schema = definitions[name]["inputSchema"]
+            self.assertIn("command_id", schema["properties"])
+            self.assertEqual(
+                schema["properties"]["command_id"]["description"],
+                "Canonical coding-tools-mcp 0.3 command handle.",
+            )
+            self.assertIn("process_session_id", schema["properties"])
+            self.assertIn("session_id", schema["properties"])
+
+        v25_by_name = {item["name"]: item for item in self._v25_definitions()}
+        self.assertNotIn("command_id", v25_by_name["task_poll"]["inputSchema"]["properties"])
+        self.assertNotIn("command_id", v25_by_name["task_stop"]["inputSchema"]["properties"])
+
     def test_promoted_direct_tools_preserve_existing_authoritative_contracts(self) -> None:
         legacy = {item["name"]: item for item in self._legacy_definitions()}
         definitions = {

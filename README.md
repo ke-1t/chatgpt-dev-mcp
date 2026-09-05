@@ -4,7 +4,20 @@
 
 `chatgpt-dev-mcp` is a small local policy wrapper around [`xyTom/coding-tools-mcp`](https://github.com/xyTom/coding-tools-mcp). It keeps the upstream workspace/symlink/patch/command/output controls and adds an explicit registry and profile layer for ChatGPT Desktop or another MCP client.
 
-**Relationship to upstream:** this is an independent MIT-licensed wrapper project, not a fork. It does not copy any upstream implementation code. `coding-tools-mcp==0.2.3` is declared as a runtime dependency and its Apache-2.0 notices remain in the installed package; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+**Relationship to upstream:** this is an independent MIT-licensed wrapper project, not a fork. It does not copy any upstream implementation code. `coding-tools-mcp==0.3.0` is declared as a runtime dependency and its Apache-2.0 notices remain in the installed package; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+The upstream 0.3 command contract is canonical at the runtime boundary: commands
+are addressed by `command_id`, output references use
+`command:<id>:stdout`/`command:<id>:stderr`, and explicit termination uses
+`kill_command`. `notifications/cancelled` only cancels the MCP request; it does
+not terminate a workspace command. `get_default_cwd` and `set_default_cwd` are
+not exposed; commands use an explicit workspace-relative `workdir`. DevMCP's
+outer `session_id` remains the development-workspace authority, while
+`process_session_id`/the legacy process `session_id` spelling are compatibility
+aliases for the upstream command handle. The v26 surface advertises
+`command_id` directly. The physical STDIO child retains the upstream workspace
+runtime across logical reconnects, so command handles and retained output are
+not tied to one MCP handshake.
 
 ## Safety contract
 
@@ -426,7 +439,7 @@ does not publish a non-loopback listener or replace the current ChatGPT path.
 4. For an approved code change, call `workspace_request_development`, show the returned confirmation to the user, then call `workspace_create_development_session` only after explicit confirmation.
 5. Call `workspace_status` / `workspace_session_status`, then use `read_file`, `list_files`, `search_text`, `git_status`, and `git_diff` with the explicit `session_id` returned by the isolated start.
 6. For concurrent writers, create Task Ledger records, acquire `director_writer_lease` with `task_id`, `paths[]`, and optional `resources[]`, then pass the matching `session_id` and `lease_id` to both `patch_preflight` and `apply_patch`. Empty scopes fail closed; overlapping path/resource scopes fail closed across the logical project.
-7. Use only config-registered `run_task(test|lint|build|format|dev)` commands with `session_id`. For a separately approved bounded argv operation, use `arbitrary_command_preflight` then `arbitrary_command_run`; it uses a fixed cwd, expected HEAD, scrubbed environment, timeout, and bounded output. Poll with the returned `process_session_id` plus `development_session_id`; stop a long-lived task with `task_stop`. Record verification with the same session/task identity; receipts are pinned to the current revision/diff and become stale after later writes.
+7. Use only config-registered `run_task(test|lint|build|format|dev)` commands with `session_id`. For a separately approved bounded argv operation, use `arbitrary_command_preflight` then `arbitrary_command_run`; it uses a fixed cwd, expected HEAD, scrubbed environment, timeout, and bounded output. Poll with the returned canonical `command_id` (the outer `process_session_id` alias is retained for compatibility) plus `development_session_id`; stop a long-lived task with `task_stop`. Record verification with the same session/task identity; receipts are pinned to the current revision/diff and become stale after later writes.
 8. Run `security_audit` after verification. Its deterministic receipt is pinned to the same worktree, revision/diff, and verification receipt; the receipt is task-agnostic, retries retain the first audit timestamp, and conflicting identity reuse fails closed. `workspace_integration_preflight` requires matching verification/security evidence before it issues an explicit integration confirmation challenge.
 9. Use `workspace_session_diff` to review a retained DEVELOPMENT session. After an approved `workspace_integration_preflight`, `workspace_integrate_development_session` may apply that exact patch to a clean/conflict-free canonical repository. It never commits, pushes, checks out, or deletes the session worktree.
 10. Close with `workspace_close_development_session`; clean worktrees are removed, dirty worktrees are retained for review.

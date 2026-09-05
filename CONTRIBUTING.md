@@ -4,7 +4,7 @@ Thank you for considering a contribution. This project is a thin, security-focus
 
 ## Ground rules
 
-* **Keep the upstream boundary.** Do not copy, vendor, or reimplement `coding-tools-mcp` source code. The runtime dependency stays pinned in `pyproject.toml` (`coding-tools-mcp==0.2.3` unless the maintainers explicitly bump it).
+* **Keep the upstream boundary.** Do not copy, vendor, or reimplement `coding-tools-mcp` source code. The runtime dependency stays pinned in `pyproject.toml` (`coding-tools-mcp==0.3.0` unless the maintainers explicitly bump it). The 0.3 command contract uses `command_id`, `kill_command`, and `command:<id>:...` output references; do not restore removed cwd tools with compatibility fakes.
 * **Preserve public contracts.** The v25 Stable Gateway surface (exactly 52 direct tools) is immutable; changes that alter tool names, schemas, counts, hashes, or error semantics require maintainer review against the schema-stability tests.
 * **Fail closed by default.** New capabilities must deny unknown input, avoid arbitrary shell/exec surfaces, never return credentials or raw secrets, and add tests proving the denial paths.
 * **No secrets, ever.** Never commit API keys, tokens, personal configuration, local absolute paths such as `/Users/<name>/...`, or private project names. Use `example.com`, `example.invalid`, temporary directories, or `~` placeholders in fixtures and docs.

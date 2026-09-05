@@ -14,6 +14,8 @@ receipts must survive a Connector reconnect.  Handshake state must not.
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import os
 import sys
@@ -48,6 +50,23 @@ _PRE_OPERATION_METHODS = frozenset(
         "server/discover",
     }
 )
+
+_CURRENT_REQUEST_ID: ContextVar[str | int | None] = ContextVar("devmcp_current_request_id", default=None)
+
+
+@contextmanager
+def request_id_scope(request_id: str | int | None):
+    """Carry the JSON-RPC id across coding-tools-mcp 0.3 dispatch."""
+
+    token = _CURRENT_REQUEST_ID.set(request_id)
+    try:
+        yield
+    finally:
+        _CURRENT_REQUEST_ID.reset(token)
+
+
+def current_request_id() -> str | int | None:
+    return _CURRENT_REQUEST_ID.get()
 
 
 class ProtocolState(str, Enum):
@@ -426,8 +445,10 @@ def dispatch_rpc_compat(
         elif runtime.initialized and method not in _PRE_OPERATION_METHODS:
             state.operation_started = True
 
+    dispatch_request_id = candidate_id if isinstance(candidate_id, (str, int)) and not isinstance(candidate_id, bool) else None
     try:
-        response = dispatch_rpc(runtime, request)
+        with request_id_scope(dispatch_request_id):
+            response = dispatch_rpc(runtime, request)
     except Exception:
         if tracked_request_id is not None:
             try:

@@ -202,6 +202,8 @@ class HttpTransportTests(unittest.TestCase):
         self.assertNotEqual(session_a, session_b)
         self.assertTrue(init_a["result"]["capabilities"]["tools"]["listChanged"])
         self.assertTrue(init_b["result"]["capabilities"]["tools"]["listChanged"])
+        self.assertEqual(self.server.sessions.get(session_a).runtime.telemetry._base_properties["transport"], "http")
+        self.assertEqual(self.server.sessions.get(session_b).runtime.telemetry._base_properties["transport"], "http")
 
         for session_id, request_id in ((session_a, "a-list"), (session_b, "b-list")):
             status, _headers, response = _request(

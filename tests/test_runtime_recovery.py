@@ -154,6 +154,7 @@ class RuntimeRecoveryTests(unittest.TestCase):
 
     def test_deferred_restart_runs_only_after_stdio_response_flush(self) -> None:
         from chatgpt_dev_mcp.chatgpt_connector_compat import serve_stdio_compat
+        from coding_tools_mcp.telemetry import SessionTelemetry
 
         events: list[tuple[str, str]] = []
 
@@ -163,13 +164,18 @@ class RuntimeRecoveryTests(unittest.TestCase):
 
             def __init__(self) -> None:
                 self._deferred: list[Callable[[], object]] = []
+                self.telemetry = SessionTelemetry(permission_mode="safe", transport="stdio")
 
-            def initialize(self, client_info=None):
+            def initialize(self, client_info=None, protocol_version=None):
+                self.initialized = True
                 return {
-                    "protocolVersion": self.protocol_version,
+                    "protocolVersion": protocol_version or self.protocol_version,
                     "capabilities": {"tools": {"listChanged": True}},
                     "serverInfo": {"name": "deferred", "version": "test"},
                 }
+
+            def server_identity(self):
+                return {"name": "deferred", "version": "test"}
 
             def list_tools(self):
                 return {"tools": [{"name": "restart"}]}
@@ -182,12 +188,12 @@ class RuntimeRecoveryTests(unittest.TestCase):
                 for action in actions:
                     action()
 
-            def call_tool(self, name, arguments, *, request_id=None):
+            def call_tool(self, name, arguments, *, request_id=None, context=None):
                 self.defer_after_response(lambda: events.append(("action", output.getvalue())))
                 return {"structuredContent": {"status": "recovering"}}
 
             def close(self):
-                return None
+                self.telemetry.finish()
 
         runtime = Runtime()
         output = StringIO()

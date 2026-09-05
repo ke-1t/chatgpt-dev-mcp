@@ -7,8 +7,6 @@ from collections.abc import Mapping
 
 REGISTRY_CATEGORY_TOOL_GROUPS: Mapping[str, tuple[str, ...]] = {
     "platform_runtime": (
-        "get_default_cwd",
-        "set_default_cwd",
         "request_permissions",
         "system_inspect",
         "external_capability_status",
@@ -138,4 +136,3 @@ __all__ = [
     "registry_category",
     "registry_shard",
 ]
-

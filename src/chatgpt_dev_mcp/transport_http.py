@@ -35,6 +35,7 @@ from coding_tools_mcp.protocol import (
 )
 
 from .server import WrapperRuntime, load_registry
+from .chatgpt_connector_compat import request_id_scope
 from .connection_doctor import diagnose_connection
 from .connection_observability import ConnectionObservabilityStore
 from .observability import HEALTH_SCHEMA_REVISION, TOOL_SCHEMA_REVISION, registry_health, schema_consistency, tool_schema_metadata
@@ -59,6 +60,12 @@ MAX_HTTP_BODY_BYTES = 1 * 1024 * 1024
 MAX_SESSION_ID_BYTES = 256
 SESSION_ID_PREFIX = "mcp_"
 _SESSION_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+
+
+def _default_http_runtime_factory() -> WrapperRuntime:
+    """Create the wrapper runtime with the HTTP telemetry contract."""
+
+    return WrapperRuntime(transport="http")
 
 
 def _normalized_initialize_params(request: dict[str, Any]) -> str:
@@ -215,7 +222,7 @@ class WrapperHTTPSessionManager:
 
     def __init__(
         self,
-        runtime_factory: Callable[[], WrapperRuntime] = WrapperRuntime,
+        runtime_factory: Callable[[], WrapperRuntime] = _default_http_runtime_factory,
         *,
         max_sessions: int = DEFAULT_MAX_HTTP_SESSIONS,
         session_ttl_seconds: float = DEFAULT_HTTP_SESSION_TTL_SECONDS,
@@ -571,7 +578,7 @@ class WrapperMCPHTTPServer(ThreadingHTTPServer):
         self,
         server_address: tuple[str, int],
         *,
-        runtime_factory: Callable[[], WrapperRuntime] = WrapperRuntime,
+        runtime_factory: Callable[[], WrapperRuntime] = _default_http_runtime_factory,
         max_sessions: int = DEFAULT_MAX_HTTP_SESSIONS,
         session_ttl_seconds: float = DEFAULT_HTTP_SESSION_TTL_SECONDS,
         max_retired_session_ids: int = DEFAULT_MAX_RETIRED_SESSION_IDS,
@@ -917,7 +924,9 @@ class WrapperMCPHandler(BaseHTTPRequestHandler):
         retry_count = 0
         while True:
             try:
-                response = dispatch_rpc(record.runtime, request)
+                request_id = response_id(request)
+                with request_id_scope(request_id):
+                    response = dispatch_rpc(record.runtime, request)
             except (ConnectionError, BrokenPipeError, EOFError, TimeoutError, OSError) as exc:
                 if (
                     retry_count == 0
@@ -1060,7 +1069,7 @@ class WrapperMCPHandler(BaseHTTPRequestHandler):
 
 
 def serve_http(
-    runtime_factory: Callable[[], WrapperRuntime] = WrapperRuntime,
+    runtime_factory: Callable[[], WrapperRuntime] = _default_http_runtime_factory,
     *,
     host: str = "127.0.0.1",
     port: int = 8000,

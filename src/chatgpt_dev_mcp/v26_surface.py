@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+from coding_tools_mcp.protocol import RequestContext
 from coding_tools_mcp.tool_results import make_tool_result
 
 from .connector_resilience import classify_client_schema_evidence
@@ -87,6 +88,31 @@ _SPLIT_REQUIRED_FIELDS: Mapping[str, tuple[str, ...]] = {
     "desktop_runtime_logs": ("instance_id",),
     "desktop_runtime_stop": ("instance_id",),
 }
+
+_COMMAND_HANDLE_SCHEMA = {
+    "type": "string",
+    "minLength": 1,
+    "description": "Canonical coding-tools-mcp 0.3 command handle.",
+}
+
+
+def _project_command_handle_tool(template: Mapping[str, Any]) -> dict[str, Any]:
+    """Advertise the v0.3 command handle while retaining old aliases."""
+
+    tool = copy.deepcopy(dict(template))
+    schema = tool.get("inputSchema")
+    if not isinstance(schema, dict):
+        raise ValueError("command tool input schema is missing")
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        raise ValueError("command tool input schema properties are missing")
+    properties["command_id"] = copy.deepcopy(_COMMAND_HANDLE_SCHEMA)
+    description = str(tool.get("description") or "")
+    tool["description"] = (
+        f"{description} Use command_id as the canonical coding-tools-mcp 0.3 handle; "
+        "process_session_id and session_id remain compatibility aliases."
+    ).strip()
+    return tool
 
 
 def _expanded_names() -> tuple[str, ...]:
@@ -471,6 +497,9 @@ def build_v26_surface(
             rendered.append(copy.deepcopy(dict(template)))
             rendered.append(_doctor_tool(template.get("outputSchema") or {"type": "object"}))
             continue
+        if name in {"task_poll", "task_stop"}:
+            rendered.append(_project_command_handle_tool(template))
+            continue
         if name == "run_task":
             for public_name, task, title, description in _RUN_TASK_SPLITS:
                 tool = _tool_from_template(
@@ -748,27 +777,28 @@ class V26RuntimeAdapter:
         arguments: dict[str, Any] | None,
         *,
         request_id: str | int | None = None,
+        context: RequestContext | None = None,
     ) -> dict[str, Any]:
         args = dict(arguments or {})
         self._pin_v26_schema_identity()
         if name == "server_info":
-            return self._project_server_info(self._runtime.call_tool(name, args, request_id=request_id))
+            return self._project_server_info(self._call_runtime(name, args, request_id=request_id, context=context))
         if name == "director_health":
             return self._project_director_health(
                 args,
-                self._runtime.call_tool(name, args, request_id=request_id),
+                self._call_runtime(name, args, request_id=request_id, context=context),
             )
         if name == "capability_catalog":
             include_deprecated = args.get("include_deprecated", False)
             if not isinstance(include_deprecated, bool):
-                return self._runtime.call_tool(name, args, request_id=request_id)
+                return self._call_runtime(name, args, request_id=request_id, context=context)
             args["include_deprecated"] = include_deprecated
             has_filter = any(
                 isinstance(args.get(field), str) and bool(str(args[field]).strip())
                 for field in ("prefix", "category", "shard", "query")
             )
             if has_filter:
-                return self._runtime.call_tool(name, args, request_id=request_id)
+                return self._call_runtime(name, args, request_id=request_id, context=context)
             gateway = getattr(self._runtime, "_stable_capability_gateway", None)
             overview = getattr(gateway, "overview", None)
             if not callable(overview):
@@ -805,8 +835,21 @@ class V26RuntimeAdapter:
             target, discriminator, value = dispatch
             args.pop(discriminator, None)
             args[discriminator] = value
-            return self._runtime.call_tool(target, args, request_id=request_id)
-        return self._runtime.call_tool(name, args, request_id=request_id)
+            return self._call_runtime(target, args, request_id=request_id, context=context)
+        return self._call_runtime(name, args, request_id=request_id, context=context)
+
+    def _call_runtime(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        request_id: str | int | None,
+        context: RequestContext | None,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"request_id": request_id}
+        if context is not None:
+            kwargs["context"] = context
+        return self._runtime.call_tool(name, arguments, **kwargs)
 
     def close(self) -> None:
         self._runtime.close()
